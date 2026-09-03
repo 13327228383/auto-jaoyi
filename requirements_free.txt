@@ -1,0 +1,11 @@
+# 免费数据源依赖（无需付费 token / 付费量化接口）
+# 主源只需 akshare；efinance / baostock 作为兜底，建议一起装
+akshare
+efinance
+baostock
+pandas
+numpy
+requests
+plyer
+# 实盘下单用（已装可忽略）
+easytrader

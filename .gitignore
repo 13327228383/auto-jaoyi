@@ -1,0 +1,34 @@
+# ---- 敏感 / 运行时数据（绝不提交）----
+# 同花顺委托账号密码：本地真实配置严禁入库
+config.ini
+*.lock
+owned_positions.json
+auto_state.json
+review_state.json
+
+# ---- 日志（含成交明细与动作流水，脱敏前不公开）----
+*.log
+auto_console.log
+auto_trade.log
+
+# ---- 缓存与回测数据 ----
+cache/
+
+# ---- IDE / 工具 ----
+.idea/
+.vscode/
+*.iml
+__pycache__/
+*.py[cod]
+
+# ---- OS ----
+Thumbs.db
+.DS_Store
+# ---- 本地IDE/记忆/工具（个人上下文，不公开）----
+.claude/
+.deepseek/
+.workbuddy/
+.idea/
+
+# ---- 券商账号/密码清单（严禁公开）----
+备注信息
