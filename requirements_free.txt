@@ -1,5 +1,5 @@
-# 免费数据源依赖（无需付费 token / 付费量化接口）
-# 主源只需 akshare；efinance / baostock 作为兜底，建议一起装
+# 依赖清单（64-bit 决策环境）
+# 免费数据源，无需付费 token / 付费量化接口。主源只需 akshare；efinance / baostock 兜底。
 akshare
 efinance
 baostock
@@ -7,5 +7,11 @@ pandas
 numpy
 requests
 plyer
-# 实盘下单用（已装可忽略）
-easytrader
+
+# ---- 实盘下达（32-bit 执行环境）----
+# 决策(64-bit)、执行(32-bit)双 Python 环境，指令文件通信。
+# 执行端需在 【32位】 Python 下安装以下库，以驱动 32 位同花顺 xiadan.exe：
+pywinauto            # 填表 + 桌面自动化（win32 backend）
+pywin32              # win32api / win32gui / win32con 物理点击与窗口枚举
+ddddocr              # 验证码 OCR 识别
+# easytrader 仅在"读持仓对账"时兜底使用（可装可不装，已装需配它自己的依赖）

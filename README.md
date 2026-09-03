@@ -26,20 +26,25 @@ AI 驱动的智能量化交易引擎探索版：基于**行情自适应的多资
 ## 快速开始
 
 ```bash
-# 1) 复制配置模板并填入你自己的券商账号密码
+# 1) 复制配置模板（只需填 exe_path，账号密码由同花顺客户端「记住密码」完成，本仓库不含）
 cp config.example.ini config.ini
 
-# 2) 安装依赖
+# 2) 安装依赖（分 64/32 位两套，详见 DEPLOY.md）
 pip install -r requirements_free.txt
 
 # 3) （研究用）运行回测
 python research/backtest_daily_halt.py
 
-# 4) （实盘用）启动主程序
+# 4) （实盘用）启动主程序（需先装 32 位执行端 + 同花顺客户端）
 start_auto.bat
 ```
 
+> 完整部署步骤（同花顺客户端准备、双 Python 环境、回测验证、常见问题）见 **[DEPLOY.md](./DEPLOY.md)**。
 > **请勿直接使用本仓库的 `config.ini` —— 真实配置已通过 `.gitignore` 排除并仅以脱敏模板 `config.example.ini` 提供。**
+
+## 部署与实盘
+
+完整的环境搭建（64/32 位双 Python）、同花顺客户端准备、回测与实盘启动步骤见 **[DEPLOY.md](./DEPLOY.md)**。
 
 ## 实盘参数清单
 
@@ -55,6 +60,7 @@ exec32_trade.py        # 32-bit 执行器（驱动同花顺）
 keep_awake.py          # 交易时段防休眠
 research/              # 全部回测/参数扫描/对比脚本（诚实口径）
 PARAMS_README.md       # 实盘参数全清单
+DEPLOY.md              # 完整部署与实盘指南
 config.example.ini     # 配置脱敏模板
 ```
 
