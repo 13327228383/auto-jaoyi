@@ -47,7 +47,7 @@ def day_target(price, d, sr_params=None, universe=None):
 
 def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_trail_pct=None,
                    def_mom_days=None, universe=None, invest_ratio=1.0,
-                   t1_codes=None):
+                   t1_codes=None, price_open=None, slip=0.0):
     """逐日模拟：每日决策 + 最小调仓间隔 min_hold(自然日)。返回指标 dict。
     def_trail_pct: 防御资产(如黄金)的跟踪止损百分比。为 None 时防御资产不设止损(原版)；
                    传数值则为防御资产也启用跟踪止损(用于压缩回撤，见 backtest_def_stop.py)。
@@ -57,7 +57,18 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
                   该比例，剩余现金闲置=0收益）——用于量化"买(满仓) vs 不买(闲置现金)"的差异。
     t1_codes: T+1 标的集合。这些标的当日触发回撤止损时【当日无法卖出】，延迟到次一交易日
               才离场（承受次日继续下探的代价）——真实反映 A股股票ETF (沪深300/中证500/创业板)
-              的 T+1 卖约束。None=全部按 T+0 当日可离场（当前生产脚本口径）。"""
+              的 T+1 卖约束。None=全部按 T+0 当日可离场（当前生产脚本口径）。
+    price_open: 与 price 对齐的开盘价 DataFrame。传入则启用【次日开盘价成交】执行口径
+              —— 决策日(d 收盘)的 target 在次一交易日(次开盘)以开盘价成交/建仓，消除
+              "当日收盘价成交"的前视偏差(白拿新强势确认日跳涨)。
+    slip: 单侧滑点比例(小数)。>0 时每次买入/卖出在手续费外按成交价*(1∓slip) 额外计磨损。
+          默认 slip 由调用方显式传入；此处 0.0=不加滑点。
+    """
+    if price_open is not None:
+        return simulate_daily_open(price, min_hold, trail_pct=trail_pct, sr_params=sr_params,
+                                   def_trail_pct=def_trail_pct, def_mom_days=def_mom_days,
+                                   universe=universe, invest_ratio=invest_ratio,
+                                   t1_codes=t1_codes, open_=price_open, slip=slip)
     dates = price.index
     daily_ret = price.pct_change().fillna(0.0)
     port = pd.Series(0.0, index=dates)
@@ -141,7 +152,8 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
 
             if entered and key != cur_key:      # 主动换仓：收手续费、计次数、重置间隔
                 switches += 1
-                adj.loc[dates >= d] *= (1 - bse.FEE)
+                # 齐平实盘"当日尾盘成交"：换仓=卖出旧+买入新(双边)，除佣金外各记单侧滑点
+                adj.loc[dates >= d] *= (1 - bse.FEE) * (1 - slip) ** 2
                 last_switch = d
             elif not entered:
                 entered = True
@@ -155,9 +167,9 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
                     rebuild_override = invest_ratio * sum(w * daily_ret.loc[d, c] for c in held)
                 else:
                     rebuild_override = 0.0
-                # 停损→再入：实盘是「先卖止损仓、再买入」，两头都收佣金 → 计一次双边
+                # 停损→再入：实盘是「先卖止损仓、再买入」，两头都收佣金 → 计一次双边(+双边滑点)
                 if stop_today and tgt != "cash":
-                    adj.loc[dates >= d] *= (1 - bse.ROUND_TRIP)
+                    adj.loc[dates >= d] *= (1 - bse.ROUND_TRIP) * (1 - slip) ** 2
                 held = set()
                 entry, stop, peak = {}, {}, {}
                 if tgt != "cash":
@@ -183,6 +195,165 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
                 port.loc[d] = rebuild_override       # 建仓日：记旧持仓走势，而非新标的
             else:
                 port.loc[d] = invest_ratio * sum(w * daily_ret.loc[d, c] for c in held)
+            invested += 1
+        else:
+            port.loc[d] = 0.0
+
+    equity = (1 + port).cumprod() * adj
+    n = max(len(equity), 1)
+    cum = float(equity.iloc[-1])
+    ann = float(cum ** (252.0 / n) - 1) if cum > 0 else -1.0
+    maxdd = float(((equity - equity.cummax()) / equity.cummax()).min())
+    rr = equity.pct_change().dropna()
+    sd = float(rr.std())
+    sharpe = float(rr.mean() / sd * np.sqrt(252)) if sd > 0 else float("nan")
+    calmar = ann / abs(maxdd) if maxdd < 0 else float("nan")
+    return {"equity": equity, "cum": cum, "ann": ann, "maxdd": maxdd,
+            "sharpe": sharpe, "calmar": calmar, "switches": switches,
+            "stop_exits": stop_exits, "time_in_mkt": invested / max(n - 1, 1)}
+
+
+def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_trail_pct=None,
+                        def_mom_days=None, universe=None, invest_ratio=1.0,
+                        t1_codes=None, open_=None, slip=0.0):
+    """【次日开盘价成交 + 滑点】版逐日模拟。
+
+    与 simulate_daily(_close) 的唯一差异在执行口径：
+      - 决策日 d（d 收盘，用 price.loc[:d] 生成 target）→ 在次一交易日 next_d【开盘】成交。
+        * 卖旧 / 买新 均以 next_d 开盘价(open_)[+滑点] 执行，消除"当日收盘成交"前视
+          (白拿新强势确认日跳涨及其后隔夜 gap)。
+        * 新建仓标的在建仓日其 on-risk 收益 = 开盘→收盘(open_ret)；此后 = 收盘→收盘。
+      - slip 每次单边(买/卖)在手续费外按 (1∓slip) 计磨损。
+    止损 / T+1 / min_hold / 防御动量门 等机制与 simulate_daily 语义保持一致。"""
+    dates = price.index
+    daily_ret = price.pct_change().fillna(0.0)
+    opn = None
+    if open_ is not None:
+        opn = open_.reindex(dates).ffill().bfill()
+    open_ret = (price / opn - 1.0).fillna(daily_ret) if opn is not None else daily_ret
+    def_code = str((sr_params or {}).get("DEFENSIVE", bse.DEF))
+
+    port = pd.Series(0.0, index=dates)
+    adj = pd.Series(1.0, index=dates)
+    switches = 0
+    stop_exits = 0
+    invested = 0
+
+    held = set()
+    entry, stop, peak = {}, {}, {}
+    pending_sell = set()          # T+1 今日触发止损、明日开盘卖出
+    last_switch = None            # 上次主动换仓决策日
+    cur_key = None
+    entered = False
+    pending_trade = None          # 今日收盘决策、明日开盘执行
+    today_entered = set()         # 今日开盘新建仓标的 → 今日收益用 open→close
+
+    def opx(d, c):
+        """取 d 日开盘价（缺失回退收盘）。"""
+        if opn is not None:
+            v = opn.loc[d, c]
+            if not (pd.isna(v) or v <= 0):
+                return v
+        return price.loc[d, c]
+
+    for i, d in enumerate(dates):
+        if i == 0:
+            continue
+        prev_d = dates[i - 1]
+        today_entered = set()
+        stop_today = False
+
+        # ---- A) 执行昨日决策：次日开盘价成交 ----
+        tr = pending_trade
+        pending_trade = None
+        if tr is not None and tr.get("build"):
+            if held:                                       # 卖出旧持仓（滑点）
+                adj.loc[dates >= d] *= (1 - slip)
+            held = set()
+            entry, stop, peak = {}, {}, {}
+            if tr.get("fee"):                              # 主动换仓双边佣金
+                adj.loc[dates >= d] *= (1 - bse.FEE)
+            if tr.get("reentry"):                          # 停损→再入 双边佣金
+                adj.loc[dates >= d] *= (1 - bse.ROUND_TRIP)
+            if tr["tgt"] != "cash":
+                adj.loc[dates >= d] *= (1 - slip)          # 买入滑点
+                for code in tr["tgt"]:
+                    c = str(code)
+                    px = opx(d, c)
+                    if c == def_code:
+                        held.add(c); entry[c] = px; stop[c] = None
+                        peak[c] = px if def_trail_pct is not None else None
+                        today_entered.add(c)
+                        continue
+                    nsup, nres = bse.compute_sr(price.loc[:prev_d, c], px)
+                    if nres is not None and px >= nres * (1 - bse.ENTRY_BUF):
+                        continue                           # 入场过滤：贴强阻力不进
+                    sp = bse.sr_stop_price(px, nsup)
+                    held.add(c); entry[c] = px; stop[c] = sp; peak[c] = px
+                    today_entered.add(c)
+            cur_key = tr["key"]
+
+        # ---- B) T+1 昨日触发止损、今日开盘卖出 ----
+        if pending_sell:
+            for c in list(pending_sell):
+                if c in held:
+                    adj.loc[dates >= d] *= (1 - slip)      # 卖出滑点
+                    held.discard(c); entry.pop(c, None); stop.pop(c, None); peak.pop(c, None)
+                    stop_exits += 1
+                    stop_today = True
+            pending_sell = set()
+
+        # ---- C) 持仓内部：S/R / 跟踪止损 ----
+        if held:
+            for c in list(held):
+                px = price.loc[d, c]
+                is_def = (c == def_code)
+                this_trail = def_trail_pct if is_def else trail_pct
+                if this_trail is None:
+                    continue
+                if peak.get(c) is not None and px > peak[c]:
+                    peak[c] = px
+                    ts = peak[c] * (1 - this_trail)
+                    if stop.get(c) is None or ts > stop[c]:
+                        stop[c] = ts
+                if stop.get(c) is not None and px <= stop[c]:
+                    if t1_codes and c in t1_codes:
+                        pending_sell.add(c)                # T+1 当日卖不了 → 明日开盘卖
+                    else:
+                        adj.loc[dates >= d] *= (1 - slip)  # 卖出滑点
+                        held.discard(c); entry.pop(c, None); stop.pop(c, None); peak.pop(c, None)
+                        stop_exits += 1
+                        stop_today = True
+
+        # ---- D) 今日收盘决策 → 明日开盘执行 ----
+        can = (not held) or (last_switch is None) or ((d - last_switch).days >= min_hold)
+        if can:
+            tgt, _ = day_target(price, d, sr_params, universe=universe)
+            if def_mom_days and isinstance(tgt, (list, tuple)) and tgt and str(tgt[0]) == def_code:
+                dm = bse.sr.momentum(pd.Series(price.loc[:d, def_code]), def_mom_days)
+                if dm is None or np.isnan(dm) or dm <= 0:
+                    tgt = "cash"
+            key = "cash" if tgt == "cash" else tuple(sorted(str(c) for c in tgt))
+            need_fee = False
+            if entered and key != cur_key:
+                switches += 1
+                need_fee = True
+                last_switch = d                            # 主动换仓决策日
+            elif not entered:
+                entered = True
+            need_build = (not held) or (key != cur_key)
+            pending_trade = {"build": need_build,
+                             "tgt": ("cash" if key == "cash" else list(tgt)),
+                             "key": key, "fee": need_fee,
+                             "reentry": stop_today}        # 停损→再入 双边计
+
+        # ---- E) 当日收益 ----
+        if held:
+            w = 1.0 / len(held)
+            rsum = 0.0
+            for c in held:
+                rsum += w * (open_ret.loc[d, c] if c in today_entered else daily_ret.loc[d, c])
+            port.loc[d] = invest_ratio * rsum
             invested += 1
         else:
             port.loc[d] = 0.0

@@ -85,6 +85,47 @@ def load_prices():
     return price.sort_index()
 
 
+def fetch_open(code, symbol):
+    """新浪真实 ETF 全历史开盘价（缓存到 etf_<code>_open.csv）。返回 Series。
+    与 fetch_sina 同一数据源、同日期口径，供「次日开盘价成交」回测使用。"""
+    cf = os.path.join(CACHE, "etf_" + code + "_open.csv")
+    if os.path.exists(cf):
+        try:
+            s = pd.read_csv(cf, dtype={"date": str}).set_index("date")["open"]
+            if len(s) > 500:
+                return s
+        except Exception:
+            pass
+    import akshare as ak
+    df = ak.fund_etf_hist_sina(symbol=symbol)
+    df = df[["date", "open"]].copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    df["open"] = pd.to_numeric(df["open"], errors="coerce")
+    df = df.dropna()
+    df.to_csv(cf, index=False)
+    return df.set_index("date")["open"]
+
+
+def load_prices_open(codes=None):
+    """加载真实 ETF 收盘价 + 开盘价（对齐同一公共交易日）。
+    返回 (close_df, open_df)。codes=None 用全部 ALL_CODES。"""
+    if codes is None:
+        codes = list(ALL_CODES)
+    ccols, ocols = {}, {}
+    for code in codes:
+        sym = ALL_CODES[code]
+        ccols[code] = fetch_sina(code, sym)
+        ocols[code] = fetch_open(code, sym)
+    close = pd.DataFrame(ccols).dropna()
+    open_ = pd.DataFrame(ocols)
+    common = close.index.intersection(open_.index)
+    close = close.reindex(common).sort_index()
+    open_ = open_.reindex(common).sort_index()
+    close.index = pd.to_datetime(close.index)
+    open_.index = pd.to_datetime(open_.index)
+    return close.astype(float), open_.astype(float)
+
+
 def main():
     price = load_prices()
     print(f"真实ETF数据 {price.index[0].date()} ~ {price.index[-1].date()}，{len(price)} 交易日，标的 {list(price.columns)}")

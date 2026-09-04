@@ -243,7 +243,7 @@ CFG = {
     "MACRO_OFF": False,            # 调试用：True 关闭宏观层（仅轮动）
     # 轮动参数（与 backtest_compare.py / backtest_rotation.py 一致）
     "SCORE": "slope_r2",           # 'slope_r2' 斜率×R² 趋势质量分 | 'mom' 朴素动量
-    "SLOPE_WINDOW": 20,            # 打分窗口（交易日）。2026-09 backtest_megagrid 288组合全网格(real_t1真实口径)：SW20年化35.9% ≥ SW40 21.8% ≥ SW60(旧) 20.5%，SW60改20
+    "SLOPE_WINDOW": 30,            # 打分窗口（交易日）。2026-09 实盘口径重测(grid_exec_close/grid_refine，当日收盘成交+双边滑点0.1%+佣金，滚动预热6起点+评估2021+中位年化，min_hold=1 trail=3%黄金也3%)：SW30 20.2% ≥ SW26 20.8%精扫峰值 ≈ SW28 20.3%（26-30稳健高原，滑点0.05%~0.2%敏感性均领先SW32/SW40）；原SW20 13.6%、SW40 15.6%、换仓450→370、回撤-28.9→-23.4。旧 megagrid 288组合"SW20最优35.9%"为当日收盘零滑点口径(白拿确认日跳涨+无摩擦，虚高SW20)，故从20改为30
     "MA_FILTER": 60,               # 跌破该均线则剔除（防御资产豁免）；0 关闭
     "HOLD_N": 1,                   # 同时持有前几名。回测 research/backtest_freq_sweep.py(2021+样本外)：
                                    #   2W-N1 年化20.01%/回撤-10.03%/Calmar2.00/操作68 全面优于 2W-N2(18.05%/91次)，
