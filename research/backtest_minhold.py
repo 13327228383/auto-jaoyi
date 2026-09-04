@@ -46,14 +46,18 @@ def day_target(price, d, sr_params=None, universe=None):
 
 
 def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_trail_pct=None,
-                   def_mom_days=None, universe=None, invest_ratio=1.0):
+                   def_mom_days=None, universe=None, invest_ratio=1.0,
+                   t1_codes=None):
     """逐日模拟：每日决策 + 最小调仓间隔 min_hold(自然日)。返回指标 dict。
     def_trail_pct: 防御资产(如黄金)的跟踪止损百分比。为 None 时防御资产不设止损(原版)；
                    传数值则为防御资产也启用跟踪止损(用于压缩回撤，见 backtest_def_stop.py)。
     def_mom_days: 防御资产自身动量门。>0 时要求防御资产 N 日动量>0 才持有，
                   否则空仓等待(不会次日因 risk-off 仍触发而立即买回)——真正压缩防御资产下跌回撤。
     invest_ratio: 持仓日投入资金比例(0,1]。<1 模拟"多余闲置现金不动、只投一部分进目标"（仅投入
-                  该比例，剩余现金闲置=0收益）——用于量化"买(满仓) vs 不买(闲置现金)"的差异。"""
+                  该比例，剩余现金闲置=0收益）——用于量化"买(满仓) vs 不买(闲置现金)"的差异。
+    t1_codes: T+1 标的集合。这些标的当日触发回撤止损时【当日无法卖出】，延迟到次一交易日
+              才离场（承受次日继续下探的代价）——真实反映 A股股票ETF (沪深300/中证500/创业板)
+              的 T+1 卖约束。None=全部按 T+0 当日可离场（当前生产脚本口径）。"""
     dates = price.index
     daily_ret = price.pct_change().fillna(0.0)
     port = pd.Series(0.0, index=dates)
@@ -65,6 +69,7 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
 
     held = set()
     entry, stop, peak = {}, {}, {}
+    pending_sell = set()        # T+1 标的今日触发止损、但当日卖不了 -> 明日才清仓
     last_switch = None          # 上次「主动换仓」日期；止损清空→立即解锁
     cur_key = None
     entered = False             # 是否已建过仓（首次入场不另收换仓费）
@@ -76,6 +81,23 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
         stop_today = False           # 今日是否触发止损（用于：停损→再入 同样计双边成本）
 
         # ---- 1) 持仓内部：S/R/跟踪止损（独立于 min_hold） ----
+        # 先执行 T+1 标的「昨日触发、今日可卖」的离场（今日开盘价成交，承受前日触发口径）
+        if pending_sell:
+            changed = False
+            for c in list(pending_sell):
+                if c in held:
+                    px = price.loc[d, c]
+                    # 以今日执行离场：这是T+1的真实代价（比昨日触发晚1日）
+                    held.discard(c)
+                    entry.pop(c, None)
+                    stop.pop(c, None)
+                    peak.pop(c, None)
+                    stop_exits += 1
+                    stop_today = True
+                    changed = True
+            pending_sell = set()
+            if changed:
+                last_switch = None     # 止损当日解锁：可立即再配置（对应实盘 _stop_today）
         if held:
             changed = False
             for c in list(held):
@@ -91,10 +113,18 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
                     if stop.get(c) is None or ts > stop[c]:
                         stop[c] = ts
                 if stop.get(c) is not None and px <= stop[c]:
-                    held.discard(c)
-                    stop_exits += 1
-                    stop_today = True
-                    changed = True
+                    if t1_codes and c in t1_codes:
+                        # T+1: 当日触发但卖不了，记 pending 次日离场（不 discard）
+                        pending_sell.add(c)
+                        changed = True
+                    else:
+                        held.discard(c)
+                        entry.pop(c, None)
+                        stop.pop(c, None)
+                        peak.pop(c, None)
+                        stop_exits += 1
+                        stop_today = True
+                        changed = True
             if changed:
                 last_switch = None     # 止损当日解锁：可立即再配置（对应实盘 _stop_today）
 

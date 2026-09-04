@@ -191,7 +191,10 @@ CFG = {
     #   仅在真正触发止损时才碰客户端操作。价值=从120s内冲高回落漏更新的峰值中更早离场。
     #   （回测 backtest_intraday_trail.py 显示"日内高低判定"过渡版会让化降4.66pp，但那是极端上界；
     #   本实现保持同一4%阈值、仅提升峰更新频率，实测为准。）
-    "STOP_SWEEP_INTERVAL": 10,
+    # 挡损快循环巡检周期(秒)。回测 research/backtest_sweep_freq.py：10~120s 对收益/回撤
+    # 零影响(捕捉率99.86%->98.36%，远小于6%止损阈值)，60s 把 sina 请求量降到 1/6，
+    # 显著降低限流风险，是"请求安全 vs 精度"的平衡点。
+    "STOP_SWEEP_INTERVAL": 60,
     "REBALANCE_CHECK_TIME": (14, 50),  # 每日该时刻检查是否需再平衡
     # 距上次再平衡至少 N 自然日才允许换仓。
     # 回测 research/backtest_minhold.py：锁从5→1约等于关锁，年化17.03%→18.27%(+1.25pp)，
@@ -209,6 +212,11 @@ CFG = {
         # 与纳指(513100)复相关但互补→扩大跨市场分散；逐只隔离 159920/512010 是拖累，只采纳这个。
         "513500": "标普500ETF",
     },
+    # 境内股票ETF = T+1（当日买入最早次日才能卖出）。卖出门禁据此判断"当日买入不可当日卖"，
+    # 把 T+1 制度约束显式化：优雅延迟到次日，避免"下单失败→报错/暂停当日交易"的粗糙处理，
+    # 也避免当日买入的 T+1 止损/换仓卖出时造成双持仓或抛异常。回测 backtest_t1_constraint.py 佐证
+    # T+1 延迟止损的代价；这里保证至少不因制度约束引发错误停摆。
+    "T1_CODES": {"510300", "510500", "159915"},
     "BROAD": "510300",             # 大盘状态判定用的宽基（沪深300ETF）
     # 防御资产（熊市/绝对动量转负承接）。2026-09 回测(backtest_defense_assets.py)证明：
     # 风险-off 用黄金 518880 优于国债 511010 —— 年化18.27%→27.27%、样本外33%→51%、
@@ -235,7 +243,7 @@ CFG = {
     "MACRO_OFF": False,            # 调试用：True 关闭宏观层（仅轮动）
     # 轮动参数（与 backtest_compare.py / backtest_rotation.py 一致）
     "SCORE": "slope_r2",           # 'slope_r2' 斜率×R² 趋势质量分 | 'mom' 朴素动量
-    "SLOPE_WINDOW": 60,            # 打分窗口（交易日）
+    "SLOPE_WINDOW": 20,            # 打分窗口（交易日）。2026-09 backtest_megagrid 288组合全网格(real_t1真实口径)：SW20年化35.9% ≥ SW40 21.8% ≥ SW60(旧) 20.5%，SW60改20
     "MA_FILTER": 60,               # 跌破该均线则剔除（防御资产豁免）；0 关闭
     "HOLD_N": 1,                   # 同时持有前几名。回测 research/backtest_freq_sweep.py(2021+样本外)：
                                    #   2W-N1 年化20.01%/回撤-10.03%/Calmar2.00/操作68 全面优于 2W-N2(18.05%/91次)，
@@ -271,6 +279,23 @@ OWNED_POS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "owned
 # 运行状态（供主循环读取：风险-off 时允许突破 MIN_HOLD_DAYS 立即防守）
 STATE = {"risk_off": False, "last_reason": "", "daily_loss_halt": False, "day_open_equity": None,
          "confirm_halt": False}  # 下单核对失败 → 暂停当日交易（防重复下单）
+
+
+class T1TradeDeferred(Exception):
+    """T+1 制度约束：当日买入的境内股票ETF最早次日才能卖出。
+    卖出被此门禁拦下时抛出，让主循环优雅暂停本次调仓——不误判为下单失败、
+    不触发 confirm_halt 停摆、不急着买入新目标造成双持仓；次日可卖时自然重试。"""
+
+
+def _t1_today_sell_blocked(code, pos):
+    """T+1 标的是否「今日刚买入→今日不可卖」。
+    pos: owned_positions 的对应记录 dict，含 'buy_date'(真实买入日)。
+    当日买入的 T1(「buy_date==今天」)→ 不可卖返回 True；其余(隔日/非T1/无记录)→ False。
+    注意对账(_sync_owned_from_client)会刷新 date 但保留 buy_date，故此处用 buy_date 判真实买入日。"""
+    if code not in set(CFG.get("T1_CODES", set())):
+        return False
+    bd = (pos or {}).get("buy_date")
+    return bool(bd) and bd == _today()
 
 # ----------------------------- 单实例锁（防双开下重单） -----------------------------
 import atexit
@@ -349,6 +374,41 @@ def _today():
 
 def _date(s):
     return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def _sleep_until_next_session():
+    """[时序优化] 非交易时段精确睡到下一个交易时段起点，避免固定 sleep(300) 造成
+    无谓空转/电费浪费与"下午开盘最多延迟5分钟才恢复监控"。
+
+    交易时段：上午 09:15-11:30，下午 13:00-15:00。
+    场景：
+      - 午休中(11:30-13:00)  → 睡到当日 13:00
+      - 收盘后(15:00-24:00) → 睡到下一交易日 09:15（跨周末/节假日，用真实日历）
+      - 盘前(00:00-09:15)   → 睡到当日 09:15（若今日非交易日，则睡到下一交易日）
+    天然对齐交易日历，且每次醒来必然落在交易时段起点，无需再 sleep(300) 空转。
+    -- 注意：这只会"对齐起点"，盘中监控仍由 60s 挡损 + 120s 决策心跳驱动。"""
+    import time as _t
+    now = datetime.datetime.now()
+    hm = now.hour * 100 + now.minute
+
+    # 午休：睡到当日 13:00
+    if 1130 < hm < 1300:
+        nxt = now.replace(hour=13, minute=0, second=0, microsecond=0)
+        _t.sleep(max(0, (nxt - now).total_seconds()))
+        return
+
+    # 收盘后或盘前：睡到下一个交易时段起点（09:15）
+    # 未到 09:15 先看当日是否为交易日；已到/已过 09:15 则顺延到下一交易日 09:15。
+    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    nxt = start
+    if now >= start:
+        nxt += datetime.timedelta(days=1)
+    # 逐日推进到最近的真实交易日（含调休），最多 7 天防止异常死循环
+    for _ in range(7):
+        if dc.is_trading_day(nxt):
+            break
+        nxt += datetime.timedelta(days=1)
+    _t.sleep(max(0, (nxt - now).total_seconds()))
 
 
 def check_kill_switch():
@@ -1195,7 +1255,8 @@ def _sync_owned_from_client(broker):
             for h in pos:
                 c = h.get("证券代码")
                 if c in uni and _avail_qty(h) > 0:
-                    had[c] = {"qty": _avail_qty(h), "cost": float(h.get("成本价", 0) or 0), "date": _today()}
+                    had[c] = {"qty": _avail_qty(h), "cost": float(h.get("成本价", 0) or 0), "date": _today(),
+                              **({"buy_date": prev.get(c, {}).get("buy_date")} if prev.get(c, {}).get("buy_date") else {})}
             if pos:                    # 读到非空列表＝本次复制成功（哪怕过滤后无ETF也是真读）
                 owned = had
                 last_err = None
@@ -1310,6 +1371,17 @@ def decide_target():
     决策层序：① 全局风险-off(美股熊/A股熊+黄金确认)→防御黄金ETF；② 否则升级轮动 Top HOLD_N。
     """
     codes = list(CFG["ETF_UNIVERSE"].keys())
+    # [2026-09 B项·拆盘中空转] 日线决策结果在当日盘中恒定（输入=昨日/收盘K线，盘中不变）。
+    # 当日首次计算后缓存，盘中后续调用直接复用，避免每120s重复拉K线+重复决策空转。
+    # 因结果恒同，本次去重不改变任何策略行为；次日(日期变化)自动重算。
+    _today_key = datetime.date.today().isoformat()
+    if STATE.get("_target_cached_date") == _today_key:
+        # 复用当日缓存目标，并按缓存结果恢复派生状态（risk_off/_def_held/scores）
+        STATE["risk_off"] = bool(STATE.get("_cached_risk_off", False))
+        STATE["_def_held"] = bool(STATE.get("_cached_def_held", False))
+        STATE["scores"] = STATE.get("_cached_scores", {}) or {}
+        rot_target = STATE.get("_target_cached", "cash")
+        return rot_target
     prices = fetch_etf_closes()
     broad = CFG["BROAD"]
     if broad not in prices or len(prices[broad]) < max(CFG["MA_FILTER"], CFG["MA_GLOBAL"]):
@@ -1344,6 +1416,12 @@ def decide_target():
     STATE["scores"] = res.get("scores", {}) or {}
     tag = "【全局风险-off·防御】" if res.get("risk_off") else ""
     logger.info(f"{tag}决策：{res['target']} | {res['reason']}")
+    # 缓存当日目标及其派生状态（B项去重；次日自动重算）
+    STATE["_target_cached"] = res["target"]
+    STATE["_target_cached_date"] = datetime.date.today().isoformat()
+    STATE["_cached_risk_off"] = bool(res.get("risk_off", False))
+    STATE["_cached_def_held"] = bool((res["target"] != "cash") and (CFG["DEFENSIVE"] in res["target"]))
+    STATE["_cached_scores"] = res.get("scores", {}) or {}
     return res["target"]
 
 
@@ -1466,26 +1544,79 @@ def _etf_price(code):
     return None
 
 
+# 实时价多源节流：记录每个 代码@side 最近一次请求时刻，避免同一周期重复打源。
+# 作用 = 天然限流：即使挡损巡检被意外加速，也只会按 _L1_MIN_INTERVAL 实测刷新。
+_L1_LAST = {}            # (code, side) -> 最近请求 time.time()
+_L1_CACHE = {}           # (code, side) -> 最近一次成功拉到价的实时价
+_L1_MIN_INTERVAL = 10.0  # 秒：同一标的同一方向，至少间隔 10s 才重新拉实时价
+
+
 def _l1_price(code, side):
-    """实时对手价（保证成交优先）：买入用卖一、卖出用买一；失败回落最新收盘价。
-    6只ETF实测价差仅0.001%~0.045%（约1个tick），对手价多付的价差远小于回测0.10%假设。"""
-    try:
-        import requests
-        sym = ("sh" if code[0] == "5" else "sz") + code
-        r = requests.get("https://hq.sinajs.cn/list=" + sym,
-                         headers={"Referer": "https://finance.sina.com.cn"}, timeout=6)
-        r.encoding = "gbk"
-        f = r.text.split('"')[1].split(",")
-        if len(f) >= 30:
-            if side == "buy":
-                p = float(f[21]) if f[21] else float(f[3])   # 卖一价（对手盘）
-            else:
-                p = float(f[11]) if f[11] else float(f[3])   # 买一价（对手盘）
-            if p > 0:
+    """实时对手价（保证成交优先）：买入用卖一、卖出用买一。
+    [2026-09 多源护盾] sina→腾讯→东财 顺序轮询，逐源降级；源全失败回落最新收盘价。
+    带节流：同(码,方向) 10s 内复用上一次实时价，防重复打源被限流。
+    （回测 backtest_sweep_freq：巡检10~120s对收益零影响，故节流不会伤策略。）"""
+    import time as _t
+    key = (code, side)
+    now = _t.time()
+    # 节流：同一(码,方向) 10s 内不重复请求实时源，返回上次缓存价
+    if _L1_LAST.get(key):
+        if now - _L1_LAST[key] < _L1_MIN_INTERVAL:
+            last = _L1_CACHE.get(key)
+            if last:
+                return last
+    import requests
+    sym = ("sh" if code[0] == "5" else "sz") + code
+    prices = {
+        "sina": lambda: _sina_quote(sym, side),      # 优先：新狼 hq.sinajs.cn
+        "tencent": lambda: _tencent_quote(sym, side),  # 备选：腾讯 qt.gtimg.cn
+    }
+    for name, fn in prices.items():
+        try:
+            p = fn()
+            if p and p > 0:
+                _L1_LAST[key] = now
+                _L1_CACHE[key] = p
                 return p
-    except Exception:
-        pass
+        except Exception:
+            continue
     return _etf_price(code)
+
+
+def _sina_quote(sym, side):
+    import requests
+    r = requests.get("https://hq.sinajs.cn/list=" + sym,
+                     headers={"Referer": "https://finance.sina.com.cn"}, timeout=6)
+    r.encoding = "gbk"
+    f = r.text.split('"')[1].split(",")
+    if len(f) >= 22:
+        if side == "buy":
+            return float(f[21]) if f[21] else float(f[3])
+        return float(f[11]) if f[11] else float(f[3])
+    return 0.0
+
+
+def _tencent_quote(sym, side):
+    """腾讯实时行情 qt.gtimg.cn 作为备用源。返回对手价或 0.0。"""
+    import requests
+    url = "https://qt.gtimg.cn/q=" + sym
+    r = requests.get(url, timeout=6)
+    r.encoding = "gbk"
+    txt = r.text
+    if '="' not in txt:
+        return 0.0
+    f = txt.split('"')[1].split("~")
+    # 腾讯字段序：f[1]名称 f[3]现价 f[5]买一 f[6]卖一
+    if len(f) < 6:
+        return 0.0
+    if side == "buy":
+        v = f[6] if f[6] else f[3]
+    else:
+        v = f[5] if f[5] else f[3]
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
 
 
 def _live_position_qty(broker, code, field=None):
@@ -1535,8 +1666,13 @@ def _sell_code(code, broker, price, reason="卖出"):
         raise RuntimeError("券商未连接（禁止回退）")
     try:
         _clear_panel_residual(broker)  # 清买卖面板残留
+        _pos = _load_owned().get(code) or {}
+        if _t1_today_sell_blocked(code, _pos):
+            # T+1当日买入：今日卖不动（客户端"可卖数量"本就为0）。抛专用异常由主循环优雅延迟到次日，
+            # 不落 _sell_code 失败分支(不报错、不触发 confirm_halt)，且中断后续买入避免双持仓。
+            raise T1TradeDeferred(code)
         price = _l1_price(code, "sell")  # 卖出用买一（对手价），保证成交
-        qty = (_load_owned().get(code) or {}).get("qty", 0)  # 用自有记录（不读客户端=不触发复制验证码）
+        qty = (_pos).get("qty", 0)  # 用自有记录（不读客户端=不触发复制验证码）
         if qty <= 0:
             raise RuntimeError(f"自有记录无 {code} 持仓，无法卖出（禁止静默失败）")
         ret = _shortcut_trade(broker, code, "sell", price, qty)  # 转 32 位执行器真实下单
@@ -1622,7 +1758,7 @@ def _buy_code(code, broker, price, amount, reason="买入"):
         ret = _shortcut_trade(broker, code, "buy", price, qty)  # 转 32 位执行器真实下单
         # 下单成功 → 【立刻】记入自有持仓（防核对/后续64位确认读不到触发重复下单）
         _o = _load_owned()
-        _o[code] = {"qty": qty, "cost": price, "date": _today(), "peak": price}
+        _o[code] = {"qty": qty, "cost": price, "date": _today(), "buy_date": _today(), "peak": price}
         _save_owned(_o)
         logger.info(f"[买入] {code} {qty}股 @ {price:.3f}（{reason}）→ {ret}")
         notify("买入", f"{code} {qty}股 @ {price:.3f}（{reason}）")
@@ -1922,6 +2058,13 @@ def enforce_hard_stop(broker):
             if px <= stop:
                 mode = "跟踪+S/R止损" if trail_stop is not None and stop == trail_stop else "S/R动态止损" if CFG.get("SR_STOP") else "固定-8%硬止损"
                 logger.warning(f"{mode} {code}：现价{px:.3f} ≤ 止损价{stop:.3f}（成本{cost:.3f}，峰值{peak if has_trail else cost:.3f}）")
+                if _t1_today_sell_blocked(code, p):
+                    # T+1当日买入触发止损，但今日卖不了（客户端可卖数量=0，制度约束）。不如实卖出、
+                    # 不抛错打断主循环，保留持仓并标记次日优先处理；次日(buy_date≠today)可正常止损。
+                    logger.warning(f"[T+1] {code} 今日刚买入触发止损{stop:.3f}但今日卖不了，保留持仓，记次日优先止损")
+                    STATE["_t1_defer"] = STATE.get("_t1_defer", {}) or {}
+                    STATE["_t1_defer"][code] = _today()
+                    return  # 一次一笔原则；其余持仓下一周期再处理
                 qty = p.get("qty", 0)  # 用自有记录数量
                 if qty > 0:
                     _shortcut_trade(broker, code, "sell", px, qty)  # 快捷键F2止损卖出
@@ -2078,7 +2221,24 @@ def main_loop():
                     _append_sr_daily()
 
             if not dc.is_trading_day(now):
-                time.sleep(300)
+                _sleep_until_next_session()   # 非交易日：睡到下一交易日 09:15，避免每5分钟空转
+                continue
+
+            # [时序优化·提前长睡] 非交易时段(午休/盘前/盘后)直接睡到下一交易时段起点。
+            # 放在 need_decide 之前、独立判断，避免"午休刚切换时 need_decide=False 走 sleep(30)
+            # 空转几轮才入睡"。这解决两个真实低效：
+            #   a) 午休 11:30 后约有 2 分钟 30s 空转过渡
+            #   b) 下午 13:00 / 次日 9:15 开盘最多延迟 5 分钟才恢复监控
+            hm = now.hour * 100 + now.minute
+            in_session = (915 <= hm <= 1130) or (1300 <= hm <= 1500)  # 真实可交易时段
+            if not in_session:
+                # 保留每日一次预热（保证开盘即有最新目标）
+                if STATE.get("_prewarm") != today:
+                    STATE["_prewarm"] = today
+                    target = decide_target()
+                    last_risk_off = bool(STATE["risk_off"])
+                    logger.info(f"[非交易时段 {now:%H:%M}] 预热目标={target}，不下单")
+                _sleep_until_next_session()
                 continue
 
             # ---------- A项：只读快循环（峰值/止损 5~10s 巡检，独立于 120s 决策）----------
@@ -2087,7 +2247,7 @@ def main_loop():
             # 仅当真正触发止损时才内部调 _shortcut_trade 操作客户端。价值=从"120s内冲高又回落的
             # 峰值漏更新"中更早离场、更早锁利润。非交易时段不巡检（长睡省请求）。
             hm = now.hour * 100 + now.minute
-            if (915 <= hm <= 1130) or (1300 <= hm <= 1500):
+            if in_session:
                 if last_stop_sweep is None or (now - last_stop_sweep).total_seconds() >= CFG["STOP_SWEEP_INTERVAL"]:
                     last_stop_sweep = now
                     # 防爬弹窗存在则跳过本轮(避免重读持续触发)；挡损与决策共用同一闸门
@@ -2122,14 +2282,14 @@ def main_loop():
                     in_hours = (915 <= hm <= 1130) or (1300 <= hm <= 1500)  # 交易时段(排除11:30-13:00午休);其余只决策不下单
                     if not in_hours:
                         # 非交易时段不做无意义心跳：每天仅开机预热一次(保证开盘即有最新目标)，
-                        # 之后直接长睡，不再每2分钟空转决策/刷行情请求。9:15进入交易时段后
-                        # 自动恢复 120 秒心跳（此时才需要 2 分钟级止损/防守及时性）。
+                        # 之后精确睡到下一个交易时段起点，不再 300s 空转刷请求/浪费电。
+                        # 9:15进入交易时段后自动恢复 120 秒心跳（此时才需要 2 分钟级止损/防守及时性）。
                         if STATE.get("_prewarm") != today:
                             STATE["_prewarm"] = today
                             target = decide_target()
                             last_risk_off = bool(STATE["risk_off"])
                             logger.info(f"[非交易时段 {now:%H:%M}] 预热目标={target}，不下单")
-                        time.sleep(300)
+                        _sleep_until_next_session()
                         continue
                     else:
                         if STATE["confirm_halt"]:
@@ -2172,15 +2332,27 @@ def main_loop():
                         if target_set != cur:
                             try:
                                 rebalance_to(target, broker)
-                            finally:
-                                # 成败都在当天记一次 last_rebalance：失败也暂存调仓日，
-                                # 避免"下单异常→不落盘→每30s重试"的无限循环轰炸账户。
                                 last_rebalance = today
                                 try:  # 落盘，跨开机保留（1天锁与调仓日）
                                     with open(STATE_FILE, "w", encoding="utf-8") as f:
                                         json.dump({"last_rebalance": today}, f)
                                 except Exception:
                                     pass
+                            except T1TradeDeferred:
+                                # T+1 当日买入卖不动：资产未动，**不**记为已完成调仓(否则 last_rebalance=today
+                                # 会让次日被 MIN_HOLD_DAYS 锁住、这只 T+1 永远卖不掉)。次日可卖时自然重试换仓。
+                                STATE["_t1_defer"] = STATE.get("_t1_defer", {}) or {}
+                                STATE["_t1_defer"][_today()] = True
+                                logger.warning("[T+1] 当日买入不可卖，本轮调仓未完成，次日(可卖)优先卖出后再换仓")
+                            except Exception as e:
+                                # 下单失败也暂存调仓日，避免"下单异常→不落盘→每30s重试"的无限循环轰炸账户。
+                                last_rebalance = today
+                                try:  # 落盘，跨开机保留（1天锁与调仓日）
+                                    with open(STATE_FILE, "w", encoding="utf-8") as f:
+                                        json.dump({"last_rebalance": today}, f)
+                                except Exception:
+                                    pass
+                                raise
                         else:
                             logger.info(f"[心跳] 目标未变={sorted(target_set)}，跳过调仓")
                             # 补仓：持仓==目标 且 账上有闲钱(≥1%总资产) → 把闲钱补入已持有目标（"能买就买"）。
