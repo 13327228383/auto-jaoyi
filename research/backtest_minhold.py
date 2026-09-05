@@ -47,7 +47,7 @@ def day_target(price, d, sr_params=None, universe=None):
 
 def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_trail_pct=None,
                    def_mom_days=None, universe=None, invest_ratio=1.0,
-                   t1_codes=None, price_open=None, slip=0.0):
+                   t1_codes=None, price_open=None, slip=0.0, sched=None):
     """逐日模拟：每日决策 + 最小调仓间隔 min_hold(自然日)。返回指标 dict。
     def_trail_pct: 防御资产(如黄金)的跟踪止损百分比。为 None 时防御资产不设止损(原版)；
                    传数值则为防御资产也启用跟踪止损(用于压缩回撤，见 backtest_def_stop.py)。
@@ -63,6 +63,9 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
               "当日收盘价成交"的前视偏差(白拿新强势确认日跳涨)。
     slip: 单侧滑点比例(小数)。>0 时每次买入/卖出在手续费外按成交价*(1∓slip) 额外计磨损。
           默认 slip 由调用方显式传入；此处 0.0=不加滑点。
+    sched: 按日参数调度 {日期: {sr_params, trail_pct, def_trail_pct, min_hold}}，用于
+           regime 研究"每天用当日行情状态对应的参数"。为 None 时全程用固定实参，行为与原来
+           完全一致（向后兼容）。仅对收盘价成交路径生效。
     """
     if price_open is not None:
         return simulate_daily_open(price, min_hold, trail_pct=trail_pct, sr_params=sr_params,
@@ -88,6 +91,17 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
     for i, d in enumerate(dates):
         if i == 0:
             continue
+        # —— regime 调度：有 sched 则按当日取参数，否则用固定实参（默认行为完全一致） ——
+        if sched is not None:
+            _sch = sched.get(d, {})
+            _sr = _sch.get("sr_params", sr_params or {})
+            _trail = _sch.get("trail_pct", trail_pct)
+            _def_trail = _sch.get("def_trail_pct", def_trail_pct)
+            _moh = _sch.get("min_hold", min_hold)
+            _def_code = str((_sr or {}).get("DEFENSIVE", bse.DEF))
+        else:
+            _sr, _trail, _def_trail, _moh = sr_params, trail_pct, def_trail_pct, min_hold
+            _def_code = def_code
         rebuild_override = None      # 建仓日应记「旧持仓当日涨幅」，而非新标的当日涨幅（消除前视）
         stop_today = False           # 今日是否触发止损（用于：停损→再入 同样计双边成本）
 
@@ -114,8 +128,8 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
             for c in list(held):
                 px = price.loc[d, c]
                 # 防御资产：仅当显式给了 def_trail_pct 才启用跟踪止损；否则豁免(原版)
-                is_def = (c == def_code)
-                this_trail = def_trail_pct if is_def else trail_pct
+                is_def = (c == _def_code)
+                this_trail = _def_trail if is_def else _trail
                 if this_trail is None:
                     continue
                 if peak.get(c) is not None and px > peak[c]:
@@ -140,23 +154,23 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
                 last_switch = None     # 止损当日解锁：可立即再配置（对应实盘 _stop_today）
 
         # ---- 2) 每日决策（受 min_hold 约束主动换仓） ----
-        can = (not held) or (last_switch is None) or ((d - last_switch).days >= min_hold)
+        can = (not held) or (last_switch is None) or ((d - last_switch).days >= _moh)
         if can:
-            tgt, _ = day_target(price, d, sr_params, universe=universe)
+            tgt, _ = day_target(price, d, _sr, universe=universe)
             # 防御动量门：防御资产自身 N 日动量转负 → 视同空仓等待（不买回，压缩防御回撤）
-            if def_mom_days and isinstance(tgt, (list, tuple)) and tgt and str(tgt[0]) == def_code:
-                dm = bse.sr.momentum(pd.Series(price.loc[:d, def_code]), def_mom_days)
+            if def_mom_days and isinstance(tgt, (list, tuple)) and tgt and str(tgt[0]) == _def_code:
+                dm = bse.sr.momentum(pd.Series(price.loc[:d, _def_code]), def_mom_days)
                 if dm is None or np.isnan(dm):
                     tgt = "cash"
-                elif sr_params and ("DEF_MOM_ENTER" in sr_params or "DEF_MOM_EXIT" in sr_params):
+                elif _sr and ("DEF_MOM_ENTER" in _sr or "DEF_MOM_EXIT" in _sr):
                     # 迟滞带（对齐实盘 auto_run DEF_MOM_ENTER=0.005 / DEF_MOM_EXIT=-0.008）：
                     #   已持有防御资产 → 动量须跌破 DEF_MOM_EXIT 才卖；未持有 → 动量须突破 DEF_MOM_ENTER 才买。
                     #   默认双 0 时退化为原「零阈值」(dm<=0 即空仓)，保证其它调用方行为不变。
-                    enter = sr_params.get("DEF_MOM_ENTER", 0.0) or 0.0
-                    exit_p = sr_params.get("DEF_MOM_EXIT", 0.0) or 0.0
-                    if (def_code in held) and dm < exit_p:
+                    enter = _sr.get("DEF_MOM_ENTER", 0.0) or 0.0
+                    exit_p = _sr.get("DEF_MOM_EXIT", 0.0) or 0.0
+                    if (_def_code in held) and dm < exit_p:
                         tgt = "cash"
-                    elif (def_code not in held) and dm <= enter:
+                    elif (_def_code not in held) and dm <= enter:
                         tgt = "cash"
                 else:
                     if dm <= 0:
@@ -189,10 +203,10 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
                     for c in tgt:
                         c = str(c)
                         px = price.loc[d, c]
-                        if c == def_code:
+                        if c == _def_code:
                             # 防御资产：不给 S/R 止损；仅当启用防御跟踪止损时初始化 peak
                             held.add(c); entry[c] = px; stop[c] = None
-                            peak[c] = px if def_trail_pct is not None else None
+                            peak[c] = px if _def_trail is not None else None
                             continue
                         nsup, nres = bse.compute_sr(price.loc[:d, c], px)
                         if nres is not None and px >= nres * (1 - bse.ENTRY_BUF):

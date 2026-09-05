@@ -1,0 +1,19 @@
+{
+  "train_window": "2014-01-15 00:00:00..2021-01-01 00:00:00",
+  "test_window": "2021-01-01 00:00:00..2026-08-31 00:00:00",
+  "regime_distribution_test": {
+    "UPTREND": 442,
+    "RANGING_WEAK": 700,
+    "HIGH_VOL": 227
+  },
+  "single_best_train": {
+    "SW": 28,
+    "trail": 0.02,
+    "moh": 7,
+    "ann": 59.15
+  },
+  "single_test_ann": 14.92,
+  "regime_test_ann": 14.79,
+  "margin_pp": -0.12,
+  "verdict": "regime 增益有限(≤2pp)，单参数已够稳"
+}
