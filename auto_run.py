@@ -195,11 +195,16 @@ CFG = {
     # 零影响(捕捉率99.86%->98.36%，远小于6%止损阈值)，60s 把 sina 请求量降到 1/6，
     # 显著降低限流风险，是"请求安全 vs 精度"的平衡点。
     "STOP_SWEEP_INTERVAL": 60,
+    # 盘中自动调参评估间隔(秒)。交易时段内每隔 TUNE_INTERVAL 呼叫一次 auto_tuner.run()，
+    # 满足护栏才切现役参数 → 决策边界前 refresh_active_params 即时热更；
+    # 收紧 SR_TRAIL_PCT 会按新阈值从峰值重算跟踪止损，跌破即真实离场（用户确认允许）。
+    "TUNE_INTERVAL": 1800,
     "REBALANCE_CHECK_TIME": (14, 50),  # 每日该时刻检查是否需再平衡
     # 距上次再平衡至少 N 自然日才允许换仓。
-    # 回测 research/backtest_minhold.py：锁从5→1约等于关锁，年化17.03%→18.27%(+1.25pp)，
-    # 回撤不变(-17.14%)，操作仅148次/10年(年~15次，并不频繁) → 采纳 MIN_HOLD_DAYS=1。
-    "MIN_HOLD_DAYS": 1,
+    # R3 堵漏：MIN_HOLD_DAYS 已从 tuning_db.TUNABLE_KEYS 移出（交易节奏，禁止盘中热改）。
+    # 此处固定为代码常量，与现役 grid_final(联合最优 SW30/trail2%/moh5) 一致，行为不变。
+    # （历史对照：单体 backtest_minhold 建议 5→1 略优 +1.25pp，但动态调参不该改持仓锁，故不采纳。）
+    "MIN_HOLD_DAYS": 5,
     # 行情缓存过期保护(交易日)：取数连续失败时，允许复用上次缓存价做决策的最大期龄。
     # 超过则不复用 → 该标的本轮视为无数据 → 决策自然趋于空仓/防御，避免"该避险没避险"。
     # 注意：执行/止损永远是实时价(_l1_price)，本键只影响决策层(fetch_etf_closes)。
@@ -363,21 +368,74 @@ logger.addHandler(_ch)
 # decide_target/止损/最小持仓 等消费方随 CFG 一并继承。DB 连不上则保持本地回测稳健最优守卫，
 # 绝不停摆、不误下单。当前现役参数缓存于 _ACTIVE_PARAM（journal 打版本号用）。
 _ACTIVE_PARAM = {}
-try:
-    import tuning_db as _tuning
-    _tunable = _tuning.get_active_params()
-    if _tunable and not _tunable.get("_fallback", False):
-        _changed = {k: _tunable[k] for k in _tuning.TUNABLE_KEYS if _tunable.get(k) is not None}
-        if _changed:
-            CFG.update(_changed)
-            logger.info(f"[DB调参] 已应用现役参数: {_changed}")
-        _ACTIVE_PARAM = {k: v for k, v in _tunable.items() if k in _tuning.TUNABLE_KEYS}
-    elif _tunable:
-        logger.info("[DB调参] DB 不可用，保持本地回测稳健最优参数")
-    _ACTIVE_PARAM_ID = _tuning.get_param_set_id(_ACTIVE_PARAM)
-except Exception as _e:
-    logger.warning(f"[DB调参] 初始化异常，保持本地参数: {_e}")
-    _ACTIVE_PARAM_ID = None
+_ACTIVE_PARAM_ID = None
+_DB_LAST_HASH = None     # 上次读取的现役参数指纹，用于热更去重
+# R7' 堵漏：DB 下发可调参数的【安全值域】。越出安全域的键整键拒绝(不入 CFG、打日志)。
+# 值域贴近研究生效域(grid_joint SW20-40/trail2-6%，外扩防呆)；越界=拒绝，绝不因 DB 误写极端值改变交易行为。
+# "单次收紧≤步长"的逐步安全由 auto_tuner 分步切换承担(落真实 param_set 行分步逼近)，故这里始终 1:1 应用
+# (applied==DB)、版号精确——不会出现"实际参数≠DB目标"的折中孤儿态。
+TUNABLE_BOUNDS = {
+    "SLOPE_WINDOW": (10, 80),        # 打分窗口(交易日)：研究域 20-40，外扩防呆
+    "SR_TRAIL_PCT": (0.01, 0.08),    # 普通标的跟踪止损%
+    "DEF_PEAK_STOP": (0.01, 0.08),   # 防御资产高点回落%
+    "DEF_MOM_DAYS": (5, 20),         # 防御动量窗口(交易日)
+    "DEF_MOM_ENTER": (0.001, 0.03),  # 进入阈值 动量>+x%
+    "DEF_MOM_EXIT": (-0.06, -0.001), # 退出阈值 动量< -x%
+    "HOLD_N": (1, 5),                # 同时持有前 N 名
+}
+
+
+def refresh_active_params(log_change=True):
+    """（热更新）从 DB 重读现役参数并覆盖 CFG 可调键。
+    只在主循环【决策边界】前调用——新参数对后续 target/止损生效，不强迫已持仓立即换仓；
+    但收紧 SR_TRAIL_PCT 会按新阈值从峰值重算跟踪止损，可能触发真实离场（调参的预期效果）。
+    返回值：True=发生变更并已应用；False=未变更或 DB 不可用。"""
+    global _ACTIVE_PARAM, _ACTIVE_PARAM_ID, _DB_LAST_HASH
+    try:
+        import tuning_db as _tn
+        tu = _tn.get_active_params()
+        if tu and tu.get("_fallback", False):
+            return False
+        if not tu:
+            return False
+        # R7' 堵漏：值域钳制，1:1 应用。越出安全域的键整键拒绝(不入 CFG、打日志)；
+        # 其余键原样应用——方案A已把"逐步逼近"上移到 auto_tuner(落真实 param_set 行分期逼近)，
+        # 故此处始终 applied==DB、版号精确，不存在折中孤儿态。DB 并发写时 active_param 是单个完整行，
+        # 要么全量生效、要么保持当前，绝无"半个参数松动"。
+        rejected = []
+        chg = {}
+        for _k in _tn.TUNABLE_KEYS:
+            if tu.get(_k) is None:
+                continue
+            _v = tu[_k]
+            _b = TUNABLE_BOUNDS.get(_k)
+            if _b is not None and not (_b[0] <= _v <= _b[1]):
+                rejected.append(_k)
+                tu.pop(_k, None)
+                continue
+            _v = float(round(_v, 6))
+            chg[_k] = _v
+            tu[_k] = _v
+        fp = tuple(sorted(chg.items()))
+        if fp == _DB_LAST_HASH:
+            return False                       # 无变化，跳过
+        _DB_LAST_HASH = fp
+        if chg:
+            CFG.update(chg)
+            if log_change:
+                logger.info(f"[DB调参] 已热更应用现役参数: {chg}"
+                            + (f"（越界拒绝 {rejected}）" if rejected else ""))
+        _ACTIVE_PARAM = {k: v for k, v in tu.items() if k in _tn.TUNABLE_KEYS}
+        # 版号：经 1:1 应用后 applied==DB active，二者即同一 param_set 行 → 参数反查精确定位；
+        # 极少数查不到行(如本行无 id/手工写脏)时回退 active_param 落库的权威 id。恒不重复、不污染。
+        _ACTIVE_PARAM_ID = _tn.get_param_set_id(_ACTIVE_PARAM) or _tn.get_active_param_set_id()
+        return True
+    except Exception as _e:
+        logger.warning(f"[DB调参] 热更读取失败，保持当前参数: {_e}")
+        return False
+
+
+refresh_active_params(log_change=True)  # 启动即应用一次
 
 
 def notify(title, msg):
@@ -2196,11 +2254,36 @@ def main_loop():
             if check_kill_switch():
                 notify("已停止", "KILL_SWITCH 存在，进程将退出")
                 break
+            # 盘中热更新：每轮决策边界前重读 DB 现役参数（调参器改库后立即生效，无需重启；
+            # 仅影响后续 target/止损，不强迫已持仓立即换仓）。DB 不可用→保持当前参数。
+            try:
+                _reparam = refresh_active_params(log_change=False)
+                # R6 堵漏：参数发生热更时，强制下轮以新参数重新决策并重刷防御迟滞，
+                # 避免切换当轮用旧参数遗留的 last_decide/_def_held 做判断（参数/状态不一致）。
+                if _reparam:
+                    last_decide = None
+                    STATE["_def_held"] = CFG["DEFENSIVE"] in set(_load_owned().keys())
+            except Exception:
+                pass
             now = datetime.datetime.now()
             today = _today()
 
             if today != last_day:
                 last_day = today
+                # —— 每交易日结束时自动评估一次（自动调参器）——
+                # 用真实成交(默认排除 is_sim 模拟)算各参数组实盘表现，满足护栏才切换现役；
+                # 现况样本 <20 交易日 → 维持现役，仅留档审计。异常静默，不影响交易。
+                try:
+                    import auto_tuner
+                    _tuner = auto_tuner.run()
+                    # 调参器落库(含分步逼近)后立即热更，消除"DB已切但内存未同步"的错标窗口；
+                    # 切换发生时重刷决策状态，保证 next 决策/止损用新参数、状态与参数一致。
+                    if _tuner and _tuner.get("changed"):
+                        if refresh_active_params(log_change=True):
+                            last_decide = None
+                            STATE["_def_held"] = CFG["DEFENSIVE"] in set(_load_owned().keys())
+                except Exception:
+                    pass
                 STATE["daily_loss_halt"] = False
                 STATE["confirm_halt"] = False  # 新的一天解除核对暂停
                 STATE["_stop_today"] = False   # 新的一天：止损解锁标记复位
@@ -2289,6 +2372,23 @@ def main_loop():
                             enforce_hard_stop(broker)  # 只读挡损：触发才碰客户端
                         except Exception as _se:
                             logger.error(f"快巡检挡损异常(继续)：{_se}", exc_info=True)
+                # —— 盘中自动调参（增量更新）——
+                # 交易时段内每 TUNE_INTERVAL 秒评估一次 auto_tuner（满足护栏才切现役）。
+                # 切换后由决策边界前 refresh_active_params 即时热更；收紧止损会按峰值重算跟踪止损
+                # → 跌破即真实离场（用户确认允许）。异常 / DB 不可用静默，绝不影响交易。
+                if (STATE.get("_tune_at") is None
+                        or (now - STATE["_tune_at"]).total_seconds() >= CFG["TUNE_INTERVAL"]):
+                    STATE["_tune_at"] = now
+                    try:
+                        import auto_tuner
+                        _tuner = auto_tuner.run()
+                        # 盘中切换同样"落库即热更"，关闭错标窗口；切换时重刷决策状态(与上面一致)
+                        if _tuner and _tuner.get("changed"):
+                            if refresh_active_params(log_change=True):
+                                last_decide = None
+                                STATE["_def_held"] = CFG["DEFENSIVE"] in set(_load_owned().keys())
+                    except Exception:
+                        pass
 
             chk = now.replace(hour=CFG["REBALANCE_CHECK_TIME"][0],
                               minute=CFG["REBALANCE_CHECK_TIME"][1], second=0, microsecond=0)

@@ -53,6 +53,8 @@ ALL_CODES = {
 }
 EXTRA_CODE = "510050,510880,159920,513500,512010".split(",")
 BASE_CODES = [c for c in ALL_CODES if c not in EXTRA_CODE]
+# 当前落地 7 只 = 原 6 只 + 513500（标普500，记忆结论唯一有价值的扩展）
+CUR7 = BASE_CODES + ["513500"]
 
 
 def fetch_sina(code, symbol):
@@ -136,11 +138,11 @@ def main():
     print("-" * len(hdr))
 
     rows = {}
-    for name, uni in [("BASE", BASE_CODES), ("EXT", list(ALL_CODES))]:
+    for name, uni in [("BASE", BASE_CODES), ("CUR7", CUR7), ("EXT", list(ALL_CODES))]:
         r = mh.simulate_daily(price, MIN_HOLD, sr_params=GOLD, def_trail_pct=DEF_TRAIL,
                               def_mom_days=DEF_MOM, universe=uni)
         rows[name] = r
-        tag = "  <- 6只基准" if name == "BASE" else "  <- +5扩展"
+        tag = "  <- 6只基准" if name == "BASE" else ("  <- 当前7只" if name == "CUR7" else "  <- +5扩展=11只")
         print(f"{name:7s}{','.join(uni):>22s}{r['cum']:>8.2f}{r['ann']*100:>8.2f}{r['maxdd']*100:>8.2f}"
               f"{r['calmar']:>8.2f}{r['sharpe']:>8.2f}{r['switches']:>6d}"
               f"{r['stop_exits']:>6d}{r['time_in_mkt']*100:>8.1f}{tag}")
@@ -152,12 +154,17 @@ def main():
         else:
             print(f"\n样本外(2021+) {name}: 数据不足")
 
-    b, x = rows["BASE"], rows["EXT"]
-    print("\n=== 结论：加 5 只扩展标的是否带来增益 ===")
-    print(f"  全期  年化: {x['ann']*100:+.2f}% (BASE {b['ann']*100:.2f}% → EXT {x['ann']*100:.2f}%)")
-    print(f"  全期  回撤: {x['maxdd']*100:+.2f}pp (BASE {b['maxdd']*100:.2f}% → EXT {x['maxdd']*100:.2f}%)")
-    print(f"  全期  Calmar: {b['calmar']:.2f} → {x['calmar']:.2f}")
-    print(f"  换仓: BASE {b['switches']}次 → EXT {x['switches']}次（扩展池频率变化）")
+    b, c, x = rows["BASE"], rows["CUR7"], rows["EXT"]
+    print("\n=== 结论：当前7只 vs 进一步扩展（真实ETF统一口径，全期） ===")
+    print(f"  6只以外再扩展的累计增量:")
+    print(f"    6→ 7(+513500): 年化 {b['ann']*100:.2f}% → {c['ann']*100:.2f}% ({(c['ann']-b['ann'])*100:+.2f}pp)  "
+          f"回撤 {b['maxdd']*100:.2f}% → {c['maxdd']*100:.2f}%  换仓 {b['switches']}→{c['switches']}")
+    print(f"    7→11(+4只):   年化 {c['ann']*100:.2f}% → {x['ann']*100:.2f}% ({(x['ann']-c['ann'])*100:+.2f}pp)  "
+          f"回撤 {c['maxdd']*100:.2f}% → {x['maxdd']*100:.2f}%  换仓 {c['switches']}→{x['switches']}")
+    for name in ("BASE", "CUR7", "EXT"):
+        so = mh.slice_metrics(rows[name], SPLIT)
+        if so:
+            print(f"  样本外(2021+) {name}: 年化 {so[0]*100:.2f}%  回撤 {so[2]*100:.2f}%")
 
 
 if __name__ == "__main__":
