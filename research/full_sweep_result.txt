@@ -1,0 +1,36 @@
+﻿统一复权OHLC 2014-01-15 ~ 2026-09-04，3069交易日，7标的
+固定 = trail2%/halt5%/mhold3/冷却2/滑点0.1%/万2.38/T+1
+风险off结构默认 = {'MA_GLOBAL': 200, 'MA_GOLD': 60, 'GOLD_LOOK': 20, 'RISK_CONFIRM_DAYS': 0, 'RISK_EXIT_DAYS': 0, 'DEFENSE_MODE': 'defensive'}（本轮扫决策打分维度，风险off参数在第2层扫）
+
+========== slope_r2 分支（4SW×3MF×2HOLD×2ABS×2DEFMOM=96） ==========
+  SCORE=slope_r2 | SW=30 | MA_FILTER=None | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=5 全期  22.28%/--25.09% Cal0.89 | 样本外  56.77%/--16.31% Cal 3.48 | 换525 损47
+  SCORE=slope_r2 | SW=30 | MA_FILTER=60 | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=10 全期  24.68%/--20.45% Cal1.21 | 样本外  63.74%/--18.61% Cal 3.42 | 换503 损50
+  SCORE=slope_r2 | SW=30 | MA_FILTER=None | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=10 全期  22.81%/--26.35% Cal0.87 | 样本外  58.28%/--17.67% Cal 3.30 | 换503 损52
+  SCORE=slope_r2 | SW=40 | MA_FILTER=60 | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=5 全期  17.46%/--23.18% Cal0.75 | 样本外  43.30%/--13.41% Cal 3.23 | 换515 损46
+  SCORE=slope_r2 | SW=40 | MA_FILTER=None | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=5 全期  16.52%/--28.30% Cal0.58 | 样本外  40.73%/--12.91% Cal 3.15 | 换528 损48
+  SCORE=slope_r2 | SW=30 | MA_FILTER=60 | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=5 全期  22.95%/--20.75% Cal1.11 | 样本外  58.68%/--19.37% Cal 3.03 | 换524 损44
+  SCORE=slope_r2 | SW=20 | MA_FILTER=60 | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=10 全期  19.91%/--17.33% Cal1.15 | 样本外  50.05%/--17.33% Cal 2.89 | 换516 损50
+  SCORE=slope_r2 | SW=20 | MA_FILTER=None | HOLD_N=1 | ABS_MOM=0.0 | DEF_MOM=10 全期  18.23%/--22.96% Cal0.79 | 样本外  45.39%/--16.41% Cal 2.77 | 换516 损50
+  分支总数 96
+
+========== mom 分支（3MOMW×3MF×2HOLD×2ABS×2DEFMOM=72） ==========
+  SCORE=mom | MOMW=20 | MA_FILTER=None | HOLD_N=1 | ABS_MOM=0.02 | DEF_MOM=5 全期  19.85%/--21.60% Cal0.92 | 样本外  49.89%/--21.60% Cal 2.31 | 换672 损43
+  SCORE=mom | MOMW=20 | MA_FILTER=None | HOLD_N=1 | ABS_MOM=0.02 | DEF_MOM=10 全期  19.24%/--22.85% Cal0.84 | 样本外  48.18%/--21.60% Cal 2.23 | 换641 损45
+  SCORE=mom | MOMW=20 | MA_FILTER=30 | HOLD_N=1 | ABS_MOM=0.02 | DEF_MOM=10 全期  18.84%/--22.85% Cal0.82 | 样本外  47.08%/--22.01% Cal 2.14 | 换642 损44
+  SCORE=mom | MOMW=20 | MA_FILTER=30 | HOLD_N=1 | ABS_MOM=0.02 | DEF_MOM=5 全期  18.52%/--23.87% Cal0.78 | 样本外  46.20%/--21.60% Cal 2.14 | 换673 损41
+  SCORE=mom | MOMW=40 | MA_FILTER=30 | HOLD_N=2 | ABS_MOM=0.0 | DEF_MOM=10 全期  14.19%/--30.14% Cal0.47 | 样本外  34.52%/--16.91% Cal 2.04 | 换718 损62
+  SCORE=mom | MOMW=40 | MA_FILTER=60 | HOLD_N=2 | ABS_MOM=0.0 | DEF_MOM=10 全期  16.43%/--32.29% Cal0.51 | 样本外  40.50%/--19.99% Cal 2.03 | 换697 损65
+  SCORE=mom | MOMW=40 | MA_FILTER=60 | HOLD_N=2 | ABS_MOM=0.02 | DEF_MOM=10 全期  16.38%/--30.15% Cal0.54 | 样本外  40.37%/--20.56% Cal 1.96 | 换675 损62
+  SCORE=mom | MOMW=40 | MA_FILTER=30 | HOLD_N=2 | ABS_MOM=0.02 | DEF_MOM=10 全期  14.67%/--27.54% Cal0.53 | 样本外  35.81%/--18.78% Cal 1.91 | 换704 损59
+
+===== 全局 Top10（全维度） =====
+  SCORE=slope_r2 SW=30 MA_FILTER=None HOLD_N=1 ABS_MOM=0.0 DEF_MOM=5 样本外Cal 3.48 全期年化 22.28% 换525 损47
+  SCORE=slope_r2 SW=30 MA_FILTER=60 HOLD_N=1 ABS_MOM=0.0 DEF_MOM=10 样本外Cal 3.42 全期年化 24.68% 换503 损50
+  SCORE=slope_r2 SW=30 MA_FILTER=None HOLD_N=1 ABS_MOM=0.0 DEF_MOM=10 样本外Cal 3.30 全期年化 22.81% 换503 损52
+  SCORE=slope_r2 SW=40 MA_FILTER=60 HOLD_N=1 ABS_MOM=0.0 DEF_MOM=5 样本外Cal 3.23 全期年化 17.46% 换515 损46
+  SCORE=slope_r2 SW=40 MA_FILTER=None HOLD_N=1 ABS_MOM=0.0 DEF_MOM=5 样本外Cal 3.15 全期年化 16.52% 换528 损48
+  SCORE=slope_r2 SW=30 MA_FILTER=60 HOLD_N=1 ABS_MOM=0.0 DEF_MOM=5 样本外Cal 3.03 全期年化 22.95% 换524 损44
+  SCORE=slope_r2 SW=20 MA_FILTER=60 HOLD_N=1 ABS_MOM=0.0 DEF_MOM=10 样本外Cal 2.89 全期年化 19.91% 换516 损50
+  SCORE=slope_r2 SW=20 MA_FILTER=None HOLD_N=1 ABS_MOM=0.0 DEF_MOM=10 样本外Cal 2.77 全期年化 18.23% 换516 损50
+  SCORE=slope_r2 SW=20 MA_FILTER=None HOLD_N=2 ABS_MOM=0.0 DEF_MOM=10 样本外Cal 2.71 全期年化 16.92% 换588 损53
+  SCORE=slope_r2 SW=30 MA_FILTER=30 HOLD_N=1 ABS_MOM=0.0 DEF_MOM=10 样本外Cal 2.71 全期年化 21.18% 换509 损51
