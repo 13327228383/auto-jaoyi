@@ -2510,5 +2510,25 @@ def main_loop():
         notify("程序异常", str(e))
 
 
+def _keep_system_awake():
+    """进程运行期间保持系统不休眠、不熄屏（防睡/防息屏加固）。
+    用 SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)，
+    独立于系统电源计划；进程退出时 Windows 自动复位。与启动 bat 的 powercfg 互为兜底，
+    避免电源计划被切/被改时仍误进入睡眠。"""
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_DISPLAY_REQUIRED = 0x00000002
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        logger.info("[防睡] SetThreadExecutionState(ES_CONTINUOUS|SYSTEM|DISPLAY_REQUIRED)：运行期间不休眠不熄屏")
+        return True
+    except Exception as e:
+        logger.warning(f"[防睡] SetThreadExecutionState 失败(忽略，靠 powercfg 兜底): {e}")
+        return False
+
+
 if __name__ == "__main__":
+    _keep_system_awake()
     main_loop()
