@@ -2151,10 +2151,9 @@ def enforce_hard_stop(broker):
                 logger.warning(f"{mode} {code}：现价{px:.3f} ≤ 止损价{stop:.3f}（成本{cost:.3f}，峰值{peak if has_trail else cost:.3f}）")
                 if _t1_today_sell_blocked(code, p):
                     # T+1当日买入触发止损，但今日卖不了（客户端可卖数量=0，制度约束）。不如实卖出、
-                    # 不抛错打断主循环，保留持仓并标记次日优先处理；次日(buy_date≠today)可正常止损。
-                    logger.warning(f"[T+1] {code} 今日刚买入触发止损{stop:.3f}但今日卖不了，保留持仓，记次日优先止损")
-                    STATE["_t1_defer"] = STATE.get("_t1_defer", {}) or {}
-                    STATE["_t1_defer"][code] = _today()
+                    # 不抛错打断主循环；次日(buy_date≠today)由常规清扫自然卖出。
+                    # 注：现为单标的持仓(HOLD_N=1)、一次一笔，无"多只待卖优先级"，无需额外记录。
+                    logger.warning(f"[T+1] {code} 今日刚买入触发止损{stop:.3f}但今日卖不了，保留持仓，次日(可卖)自然止损")
                     return  # 一次一笔原则；其余持仓下一周期再处理
                 qty = p.get("qty", 0)  # 用自有记录数量
                 if qty > 0:
@@ -2474,9 +2473,8 @@ def main_loop():
                             except T1TradeDeferred:
                                 # T+1 当日买入卖不动：资产未动，**不**记为已完成调仓(否则 last_rebalance=today
                                 # 会让次日被 MIN_HOLD_DAYS 锁住、这只 T+1 永远卖不掉)。次日可卖时自然重试换仓。
-                                STATE["_t1_defer"] = STATE.get("_t1_defer", {}) or {}
-                                STATE["_t1_defer"][_today()] = True
-                                logger.warning("[T+1] 当日买入不可卖，本轮调仓未完成，次日(可卖)优先卖出后再换仓")
+                                # 注：现为单标的持仓(HOLD_N=1)、一次一笔，无"多只待卖优先级"，无需额外记录标记。
+                                logger.warning("[T+1] 当日买入不可卖，本轮调仓未完成，次日(可卖)自然重试换仓")
                             except Exception as e:
                                 # 下单失败也暂存调仓日，避免"下单异常→不落盘→每30s重试"的无限循环轰炸账户。
                                 last_rebalance = today
