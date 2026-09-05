@@ -242,7 +242,8 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
 
 def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_trail_pct=None,
                         def_mom_days=None, universe=None, invest_ratio=1.0,
-                        t1_codes=None, open_=None, slip=0.0):
+                        t1_codes=None, open_=None, slip=0.0,
+                        reenter_cooldown=0, daily_loss_halt_pct=0.0, high_=None, low_=None):
     """【次日开盘价成交 + 滑点】版逐日模拟。
 
     与 simulate_daily(_close) 的唯一差异在执行口径：
@@ -274,6 +275,7 @@ def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, de
     entered = False
     pending_trade = None          # 今日收盘决策、明日开盘执行
     today_entered = set()         # 今日开盘新建仓标的 → 今日收益用 open→close
+    last_stop_day = {}            # 再入冷却：标的→最近一次止损触发的交易日下标 i
 
     def opx(d, c):
         """取 d 日开盘价（缺失回退收盘）。"""
@@ -344,6 +346,7 @@ def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, de
                     if stop.get(c) is None or ts > stop[c]:
                         stop[c] = ts
                 if stop.get(c) is not None and px <= stop[c]:
+                    last_stop_day[c] = i                   # 再入冷却起点：止损触发当日
                     if t1_codes and c in t1_codes:
                         pending_sell.add(c)                # T+1 当日卖不了 → 明日开盘卖
                     else:
@@ -356,6 +359,15 @@ def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, de
         can = (not held) or (last_switch is None) or ((d - last_switch).days >= min_hold)
         if can:
             tgt, _ = day_target(price, d, sr_params, universe=universe)
+            # 再入冷却（对齐实盘 REENTER_COOLDOWN_DAYS=2）：止损卖出后 N 个交易日内禁止再买回，
+            # 防止"卖了当天又接回"抖振。tgt 中的冷却标的剔除；全被冷却则转空仓。
+            if reenter_cooldown > 0 and isinstance(tgt, (list, tuple)) and tgt:
+                _cool = [c for c in tgt
+                         if str(c) in last_stop_day and (i - last_stop_day[str(c)]) < reenter_cooldown]
+                if _cool:
+                    tgt = [c for c in tgt if str(c) not in _cool]
+                    if not tgt:
+                        tgt = "cash"
             if def_mom_days and isinstance(tgt, (list, tuple)) and tgt and str(tgt[0]) == def_code:
                 dm = bse.sr.momentum(pd.Series(price.loc[:d, def_code]), def_mom_days)
                 if dm is None or np.isnan(dm):
@@ -373,6 +385,17 @@ def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, de
                 else:
                     if dm <= 0:
                         tgt = "cash"
+            # 当日熔断（对齐实盘 MAX_DAILY_LOSS_PCT=5%，见 backtest_halt_threshold.py）：今日持仓盘中自日内峰值回撤超阈值
+            # → 决策强制转防御黄金，规避闪崩日。有真实 high/low 用 峰值→谷底 振幅(能抓"插针又收回")；
+            # 无则回退 开盘→收盘(只低估)。均为当日收盘可知信息，次日开盘执行，无前视。
+            if daily_loss_halt_pct > 0 and held:
+                if (high_ is None) or (low_ is None):
+                    _dl = min((open_ret.loc[d, c] for c in held), default=0.0)
+                else:
+                    _dl = min((-(max(high_.loc[d, c], 1e-9) - low_.loc[d, c])
+                               / max(high_.loc[d, c], 1e-9)) for c in held)
+                if _dl <= -daily_loss_halt_pct:
+                    tgt = [def_code]
             key = "cash" if tgt == "cash" else tuple(sorted(str(c) for c in tgt))
             need_fee = False
             if entered and key != cur_key:
