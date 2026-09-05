@@ -358,6 +358,27 @@ _ch = logging.StreamHandler()
 _ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(_ch)
 
+# ----------------------------- 参数落库 + 自动调参（DB 单一事实源） -----------------------------
+# 若本地 MySQL 可用，用现役参数覆盖 CFG 的可调键（SLOPE_WINDOW/SR_TRAIL_PCT/...），
+# decide_target/止损/最小持仓 等消费方随 CFG 一并继承。DB 连不上则保持本地回测稳健最优守卫，
+# 绝不停摆、不误下单。当前现役参数缓存于 _ACTIVE_PARAM（journal 打版本号用）。
+_ACTIVE_PARAM = {}
+try:
+    import tuning_db as _tuning
+    _tunable = _tuning.get_active_params()
+    if _tunable and not _tunable.get("_fallback", False):
+        _changed = {k: _tunable[k] for k in _tuning.TUNABLE_KEYS if _tunable.get(k) is not None}
+        if _changed:
+            CFG.update(_changed)
+            logger.info(f"[DB调参] 已应用现役参数: {_changed}")
+        _ACTIVE_PARAM = {k: v for k, v in _tunable.items() if k in _tuning.TUNABLE_KEYS}
+    elif _tunable:
+        logger.info("[DB调参] DB 不可用，保持本地回测稳健最优参数")
+    _ACTIVE_PARAM_ID = _tuning.get_param_set_id(_ACTIVE_PARAM)
+except Exception as _e:
+    logger.warning(f"[DB调参] 初始化异常，保持本地参数: {_e}")
+    _ACTIVE_PARAM_ID = None
+
 
 def notify(title, msg):
     logger.info(f"[通知] {title}：{msg}")
@@ -1432,7 +1453,8 @@ JOURNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache",
 
 
 def journal(side, code, price, qty, reason=""):
-    """追加一条交易流水（成交后调用）。side: buy/sell/stop_sell。失败只告警不影响交易。"""
+    """追加一条交易流水（成交后调用）。side: buy/sell/stop_sell。失败只告警不影响交易。
+    同步双写：本地 JSONL（历史格式）+ DB trade_log（带 param_set_id=当时生效参数，供自动调参）。"""
     try:
         amt = round(float(price or 0) * int(qty or 0), 2)
         rec = {
@@ -1441,9 +1463,20 @@ def journal(side, code, price, qty, reason=""):
             "price": round(float(price or 0), 3),
             "qty": int(qty or 0), "amount": amt, "reason": reason,
         }
+        if _ACTIVE_PARAM:
+            rec["param"] = {k: v for k, v in _ACTIVE_PARAM.items()
+                            if k in ("SLOPE_WINDOW", "SR_TRAIL_PCT", "DEF_PEAK_STOP",
+                                     "MIN_HOLD_DAYS", "DEF_MOM_DAYS", "DEF_MOM_ENTER",
+                                     "DEF_MOM_EXIT", "HOLD_N")}
         os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
         with open(JOURNAL_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # 双写到 DB（失败静默，不影响交易）
+        try:
+            import tuning_db as _tuning
+            _tuning.insert_trade(rec, globals().get("_ACTIVE_PARAM_ID"))
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"[流水] 写交易记录失败：{e}")
 

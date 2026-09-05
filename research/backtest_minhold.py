@@ -146,8 +146,21 @@ def simulate_daily(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, def_tra
             # 防御动量门：防御资产自身 N 日动量转负 → 视同空仓等待（不买回，压缩防御回撤）
             if def_mom_days and isinstance(tgt, (list, tuple)) and tgt and str(tgt[0]) == def_code:
                 dm = bse.sr.momentum(pd.Series(price.loc[:d, def_code]), def_mom_days)
-                if dm is None or np.isnan(dm) or dm <= 0:
+                if dm is None or np.isnan(dm):
                     tgt = "cash"
+                elif sr_params and ("DEF_MOM_ENTER" in sr_params or "DEF_MOM_EXIT" in sr_params):
+                    # 迟滞带（对齐实盘 auto_run DEF_MOM_ENTER=0.005 / DEF_MOM_EXIT=-0.008）：
+                    #   已持有防御资产 → 动量须跌破 DEF_MOM_EXIT 才卖；未持有 → 动量须突破 DEF_MOM_ENTER 才买。
+                    #   默认双 0 时退化为原「零阈值」(dm<=0 即空仓)，保证其它调用方行为不变。
+                    enter = sr_params.get("DEF_MOM_ENTER", 0.0) or 0.0
+                    exit_p = sr_params.get("DEF_MOM_EXIT", 0.0) or 0.0
+                    if (def_code in held) and dm < exit_p:
+                        tgt = "cash"
+                    elif (def_code not in held) and dm <= enter:
+                        tgt = "cash"
+                else:
+                    if dm <= 0:
+                        tgt = "cash"
             key = "cash" if tgt == "cash" else tuple(sorted(str(c) for c in tgt))
 
             if entered and key != cur_key:      # 主动换仓：收手续费、计次数、重置间隔
@@ -331,8 +344,21 @@ def simulate_daily_open(price, min_hold, trail_pct=TRAIL_PCT, sr_params=None, de
             tgt, _ = day_target(price, d, sr_params, universe=universe)
             if def_mom_days and isinstance(tgt, (list, tuple)) and tgt and str(tgt[0]) == def_code:
                 dm = bse.sr.momentum(pd.Series(price.loc[:d, def_code]), def_mom_days)
-                if dm is None or np.isnan(dm) or dm <= 0:
+                if dm is None or np.isnan(dm):
                     tgt = "cash"
+                elif sr_params and ("DEF_MOM_ENTER" in sr_params or "DEF_MOM_EXIT" in sr_params):
+                    # 迟滞带（对齐实盘 auto_run DEF_MOM_ENTER=0.005 / DEF_MOM_EXIT=-0.008）：
+                    #   已持有防御资产 → 动量须跌破 DEF_MOM_EXIT 才卖；未持有 → 动量须突破 DEF_MOM_ENTER 才买。
+                    #   默认双 0 时退化为原「零阈值」(dm<=0 即空仓)，保证其它调用方行为不变。
+                    enter = sr_params.get("DEF_MOM_ENTER", 0.0) or 0.0
+                    exit_p = sr_params.get("DEF_MOM_EXIT", 0.0) or 0.0
+                    if (def_code in held) and dm < exit_p:
+                        tgt = "cash"
+                    elif (def_code not in held) and dm <= enter:
+                        tgt = "cash"
+                else:
+                    if dm <= 0:
+                        tgt = "cash"
             key = "cash" if tgt == "cash" else tuple(sorted(str(c) for c in tgt))
             need_fee = False
             if entered and key != cur_key:

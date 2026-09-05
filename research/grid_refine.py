@@ -21,6 +21,7 @@ HOLD = 1; TRAIL = 0.03
 def run(close, sw, slip, wu):
     pr = close[close.index >= wu]
     G = dict(bue.GOLD); G['SLOPE_WINDOW'] = sw; G['MOM_WINDOW'] = 20
+    G['DEF_MOM_ENTER'] = 0.005; G['DEF_MOM_EXIT'] = -0.008  # 对齐实盘防御迟滞带
     r = mh.simulate_daily(pr, HOLD, trail_pct=TRAIL, sr_params=G, def_trail_pct=TRAIL,
                           def_mom_days=10, universe=CODES, t1_codes=T1, slip=slip)
     full = r['cum'] ** (252.0 / len(r['equity'])) - 1 if r['cum'] > 0 else -1.0
@@ -45,9 +46,9 @@ def main():
     print(f"  → 精扫峰值 SW={best} ({med[best]:.1f}%)")
 
     print("\n== 邻域滑点敏感性（SW28/30/32 · slip 0.05%/0.1%/0.2%）2021+ 中位年化 ==")
-    print(f"{'slip':>7}{'SW28':>9}{'SW30':>9}{'SW32':>9}")
+    print(f"{'slip':>8}{'SW28':>9}{'SW30':>9}{'SW32':>9}")
     for sp in [0.0005, 0.0010, 0.0020]:
-        print(f"{sp*100:>6.1f}%"
+        print(f"{sp*100:>7.2f}%"
               f"{oos_med(close,28,sp):>9.1f}{oos_med(close,30,sp):>9.1f}{oos_med(close,32,sp):>9.1f}",
               flush=True)
 

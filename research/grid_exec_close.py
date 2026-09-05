@@ -31,6 +31,7 @@ SLIP = 0.001      # 基准滑点（单侧 0.1%，卖一价买入近似）
 def run(close, sw, wu, slip=SLIP):
     pr = close[close.index >= wu]
     G = dict(bue.GOLD); G['SLOPE_WINDOW'] = sw; G['MOM_WINDOW'] = 20
+    G['DEF_MOM_ENTER'] = 0.005; G['DEF_MOM_EXIT'] = -0.008  # 对齐实盘防御迟滞带
     r = mh.simulate_daily(pr, HOLD, trail_pct=TRAIL, sr_params=G, def_trail_pct=TRAIL,
                           def_mom_days=10, universe=CODES, t1_codes=T1, slip=slip)
     full = r['cum'] ** (252.0 / len(r['equity'])) - 1 if r['cum'] > 0 else -1.0
