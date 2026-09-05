@@ -1364,16 +1364,19 @@ def _tail_pursuit(broker):
     触发验证码/读持仓失败时安全跳过（沿用本地，交给次日）。
     """
     try:
-        target = decide_target()                      # 重新取当日目标（幂等，与主循环同源）
         _sync_owned_from_client(broker)               # 用真实持仓覆盖本地记录
-        target_set = set(target) if target != "cash" else set()
+        _intended = STATE.get("_intended_set")
+        if _intended is None:
+            _intended = frozenset(current_holdings(broker))   # 尚未决策 → 视持仓为意向，不越闸
+        ts = set(_intended)
         cur = current_holdings(broker)
-        if target_set == cur:
-            logger.info(f"[尾盘追单] 持仓已==目标 {sorted(target_set)}，无需追单")
+        if ts == cur:
+            logger.info(f"[尾盘追单] 持仓已==意向 {sorted(ts)}，无需追单")
             return
-        logger.warning(f"[尾盘追单] 持仓 {sorted(cur)} ≠ 目标 {sorted(target_set)}，尝试收盘前追平")
+        target = sorted(_intended) if _intended else "cash"   # 只回补到"已决定意向"，不越5天闸门
+        logger.warning(f"[尾盘追单] 持仓 {sorted(cur)} ≠ 意向 {sorted(ts)}，尝试收盘前追平")
         rebalance_to(target, broker)
-        notify("尾盘追单", f"持仓≠目标，已收盘前重试调仓：目标={sorted(target_set)}")
+        notify("尾盘追单", f"持仓≠意向，已收盘前重试调仓：目标={sorted(ts)}")
     except Exception as e:
         logger.warning(f"[尾盘追单] 失败(触发验证码/读持仓不可用)，沿用本地记录：{e}")
         # 超时预警：拖过收盘仍未能追平 → 主动通知，避免静默遗漏（次日对账/开盘再平衡兜底）
@@ -1911,6 +1914,27 @@ def rebalance_to(target, broker):
     logger.info(f"[再平衡完成] 目标={codes} 当前持仓={sorted(current_holdings(broker))}")
 
 
+def _active_switch_blocked(cur, now, last_rebalance):
+    """「5天硬闸门」——对齐回测 backtest_minhold.can()：只约束"持有仓位的主动轮动换仓"，不拦入场/止损/防守。
+    逐条对齐回测语义：
+      - 空仓(not held) → 允许立即入场，不受5天锁（空仓时周一有信号即可进场）；
+      - 持有仓位 → 距上次主动换仓 ≥ MIN_HOLD_DAYS 才允许轮动换仓（对齐回测 held→can 需满 holding）；
+      - 保护性/风控 恒放行：当日已止损(_stop_today)、当日熔断(daily_loss_halt)；
+      - 风险-off(risk_off)或正在持有防御仓(风险解除需切回进攻) → 放行，不困住黄金防御。
+    返回 True=本次主动换仓被5天锁拦截（维持持仓）；False=允许换仓。
+    enforce_hard_stop(硬止损)独立于此闸门，恒定执行，不受影响。"""
+    if STATE.get("_stop_today") or STATE.get("daily_loss_halt"):
+        return False
+    if not cur:                                          # 空仓 → 立即入场
+        return False
+    if bool(STATE.get("risk_off")) or (CFG["DEFENSIVE"] in cur):
+        return False                                     # 防守态/风险解除 → 放行
+    if last_rebalance == "":
+        return False
+    held_days = (now.date() - _date(last_rebalance)).days
+    return held_days < CFG["MIN_HOLD_DAYS"]
+
+
 # ----------------------------- 实时风控（每决策周期执行，突破1天锁） -----------------------------
 def _sina_mtm():
     """用 sina 现价 × 本地持仓记录 估算组合市值（不读客户端=不拉窗口、不触发验证码）。
@@ -2311,11 +2335,14 @@ def main_loop():
                 # 避免等 14:55 才追、遇验证码慢拖过收盘。失败则交给 14:55 尾盘兜底。
                 try:
                     if dc.is_trading_day(now) and now.hour * 100 + now.minute <= 1500:
-                        _tgt = decide_target()
-                        _ts = set(_tgt) if _tgt != "cash" else set()
+                        _intended = STATE.get("_intended_set")
+                        if _intended is None:
+                            _intended = frozenset(current_holdings(broker))
+                        _ts = set(_intended)
                         _cs = current_holdings(broker)
                         if _ts != _cs:
-                            logger.warning(f"[对账即追] 持仓 {sorted(_cs)} ≠ 目标 {sorted(_ts)}，立即追平")
+                            _tgt = sorted(_intended) if _intended else "cash"   # 只追"已决定意向"，不越5天闸门
+                            logger.warning(f"[对账即追] 持仓 {sorted(_cs)} ≠ 意向 {sorted(_ts)}，立即追平")
                             rebalance_to(_tgt, broker)
                 except Exception as _e:
                     logger.warning(f"[对账即追] 失败(跳过，交14:55尾盘兜底)：{_e}")
@@ -2462,29 +2489,40 @@ def main_loop():
                         # 回测(backtest_daily_close)证明该做法年化 7.44% > 盘中即时防守 6.27%。
                         # 盘中下行保护由 enforce_hard_stop(硬止损) 与 当日熔断 兜底，均未移除。
                         if target_set != cur:
-                            try:
-                                rebalance_to(target, broker)
-                                last_rebalance = today
-                                try:  # 落盘，跨开机保留（1天锁与调仓日）
-                                    with open(STATE_FILE, "w", encoding="utf-8") as f:
-                                        json.dump({"last_rebalance": today}, f)
-                                except Exception:
-                                    pass
-                            except T1TradeDeferred:
-                                # T+1 当日买入卖不动：资产未动，**不**记为已完成调仓(否则 last_rebalance=today
-                                # 会让次日被 MIN_HOLD_DAYS 锁住、这只 T+1 永远卖不掉)。次日可卖时自然重试换仓。
-                                # 注：现为单标的持仓(HOLD_N=1)、一次一笔，无"多只待卖优先级"，无需额外记录标记。
-                                logger.warning("[T+1] 当日买入不可卖，本轮调仓未完成，次日(可卖)自然重试换仓")
-                            except Exception as e:
-                                # 下单失败也暂存调仓日，避免"下单异常→不落盘→每30s重试"的无限循环轰炸账户。
-                                last_rebalance = today
-                                try:  # 落盘，跨开机保留（1天锁与调仓日）
-                                    with open(STATE_FILE, "w", encoding="utf-8") as f:
-                                        json.dump({"last_rebalance": today}, f)
-                                except Exception:
-                                    pass
-                                raise
+                            # 【5天硬闸门】对齐回测 backtest_minhold.can()：持有仓位距上次换仓不足
+                            # MIN_HOLD_DAYS 时拦截主动轮动换仓（省手续费/降换手，贴合回测口径）；
+                            # 空仓入场、当日止损、当日熔断、风险-off/防御仓切回 均不受限(_active_switch_blocked)。
+                            if _active_switch_blocked(cur, now, last_rebalance):
+                                STATE["_intended_set"] = frozenset(cur)   # 被拦：意向=保持当前，追单不越闸
+                                if STATE.get("_gate_log") != today:
+                                    STATE["_gate_log"] = today
+                                    logger.info(f"[5天锁] 持有仓位距上次换仓不足{CFG['MIN_HOLD_DAYS']}天，拦截主动轮动换仓（空仓入场/止损/防守/风险解除不受限）")
+                            else:
+                                STATE["_intended_set"] = frozenset(target_set)   # 允许换仓 → 记录最新意向（追单只回补到它，不越闸）
+                                try:
+                                    rebalance_to(target, broker)
+                                    last_rebalance = today
+                                    try:  # 落盘，跨开机保留（1天锁与调仓日）
+                                        with open(STATE_FILE, "w", encoding="utf-8") as f:
+                                            json.dump({"last_rebalance": today}, f)
+                                    except Exception:
+                                        pass
+                                except T1TradeDeferred:
+                                    # T+1 当日买入卖不动：资产未动，**不**记为已完成调仓(否则 last_rebalance=today
+                                    # 会让次日被 MIN_HOLD_DAYS 锁住、这只 T+1 永远卖不掉)。次日可卖时自然重试换仓。
+                                    # 注：现为单标的持仓(HOLD_N=1)、一次一笔，无"多只待卖优先级"，无需额外记录标记。
+                                    logger.warning("[T+1] 当日买入不可卖，本轮调仓未完成，次日(可卖)自然重试换仓")
+                                except Exception as e:
+                                    # 下单失败也暂存调仓日，避免"下单异常→不落盘→每30s重试"的无限循环轰炸账户。
+                                    last_rebalance = today
+                                    try:  # 落盘，跨开机保留（1天锁与调仓日）
+                                        with open(STATE_FILE, "w", encoding="utf-8") as f:
+                                            json.dump({"last_rebalance": today}, f)
+                                    except Exception:
+                                        pass
+                                    raise
                         else:
+                            STATE["_intended_set"] = frozenset(cur)        # 目标==持仓：意向=当前，追单到它即算达成
                             logger.info(f"[心跳] 目标未变={sorted(target_set)}，跳过调仓")
                             # 补仓：持仓==目标 且 账上有闲钱(≥1%总资产) → 把闲钱补入已持有目标（"能买就买"）。
                             # 每日最多1次（STATE["_topup_day"]!=today 闸门）；仅在目标已持有的无冲突窗口触发。
