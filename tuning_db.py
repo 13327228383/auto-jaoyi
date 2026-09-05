@@ -51,8 +51,11 @@ FALLBACK_ACTIVE = {
 
 
 def _read_db_conf():
-    """从 config.ini [db] 读连接；缺失则用本机默认(root/<REDACTED>)。"""
-    conf = {"host": "127.0.0.1", "port": 3306, "user": "root", "password": "REDACTED", "charset": "utf8mb4"}
+    """从 config.ini [db] 读连接；缺失则用本机默认(root/无密码)。
+    安全：DB 密码**只**从 config.ini[db].password 读取（config.ini 已在 .gitignore，严禁提交），
+    代码内不再含任何明文密码默认值。config.ini 无密码时以空串尝试连接（一般会鉴权失败，
+    tuning_db 全部函数都优雅返回 None，auto_run 保持用研发现役参数，不因 DB 缺失停摆）。"""
+    conf = {"host": "127.0.0.1", "port": 3306, "user": "root", "password": "", "charset": "utf8mb4"}
     try:
         cp = configparser.ConfigParser()
         cp.read(os.path.join(HERE, "config.ini"), encoding="utf-8")
