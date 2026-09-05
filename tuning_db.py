@@ -40,12 +40,13 @@ TUNABLE_KEYS = {
     "HOLD_N": int,
 }
 
-# 出厂/研究最优守卫（当前稳健最优，grid_final 抗摩擦选点：0.2%滑点抗性最高、回撤最小、SW不变）
+# 出厂/研究最优守卫（当前稳健最优，backtest_joint_sweep 复权干净数据联合最优：
+# trail2%/halt5%(代码常量)/SW30/mhold3/mom10；MIN_HOLD=3>5>0、trail=2%甜点）
 FALLBACK_ACTIVE = {
     "SLOPE_WINDOW": 30, "SR_TRAIL_PCT": 0.02, "DEF_PEAK_STOP": 0.02,
-    "MIN_HOLD_DAYS": 5, "DEF_MOM_DAYS": 10, "DEF_MOM_ENTER": 0.005,
+    "MIN_HOLD_DAYS": 3, "DEF_MOM_DAYS": 10, "DEF_MOM_ENTER": 0.005,
     "DEF_MOM_EXIT": -0.008, "HOLD_N": 1,
-    "note": "研究稳健最优(grid_final)：trail2%/SW30/moh5，0.1%年化25.6%、0.2%抗性10.7%、回撤-23.4%、换仓310",
+    "note": "研究稳健最优(backtest_joint_sweep复权干净数据)：trail2%/SW30/mhold3/halt5%，样本外年化63.74%、Calmar3.42",
     "source": "research_seed",
 }
 

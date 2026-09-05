@@ -32,11 +32,12 @@ import backtest_universe_ext as bue
 CURRENT_UNI = bue.BASE_CODES + ["513500"]     # 当前实盘 7 只
 SPLIT = pd.Timestamp("2021-01-01")
 
-# ---- 当前实盘全套参数（严格对齐 auto_run.py CFG）----
-MIN_HOLD = 5
-TRAIL_PCT = 0.03          # SR_TRAIL_PCT=0.03
-DEF_TRAIL = 0.03          # DEF_PEAK_STOP=0.03，防御黄金也上跟踪止损
-DEF_MOM = 10
+# ---- 当前实盘全套参数（严格对齐 auto_run.py CFG + DB 现役 active_param 权威值）----
+MIN_HOLD = bue.GOLD.get("MIN_HOLD_DAYS") or 5   # DB现役 MIN_HOLD_DAYS=5
+# DB 现役(active_param 表)权威值，而非代码默认 —— 2026-09 现有 tracker 热更下发 2%
+TRAIL_PCT = 0.02          # SR_TRAIL_PCT（现役=0.02，DB active_param 权威；代码默认 0.03 已被热更覆盖）
+DEF_TRAIL = 0.02          # DEF_PEAK_STOP（现役=0.02，与 SR_TRAIL_PCT 同源追踪）
+DEF_MOM = bue.GOLD.get("DEF_MOM_DAYS") or 10
 REENTER_CD = 2
 T1 = {"510300", "510500", "159915"}
 SLIP = 0.001              # 滑点0.1%（实盘口径，0.1%是保守上界）
@@ -44,35 +45,16 @@ SLIP = 0.001              # 滑点0.1%（实盘口径，0.1%是保守上界）
 SR_PARAMS = dict(bue.GOLD)          # 含 DEFENSIVE/GLOBAL_US/GLOBAL_GOLD/BROAD 等
 SR_PARAMS.setdefault("DEF_MOM_ENTER", 0.005)
 SR_PARAMS.setdefault("DEF_MOM_EXIT", -0.008)
+# DB 现役权威 SLOPE_WINDOW=30（strategy_rotator 代码默认 60，必须显式传 30 才对齐实盘打分窗口）
+SR_PARAMS.setdefault("SLOPE_WINDOW", 30)
 
 CACHE = bue.CACHE
 
 
 def load_ohlc_lows_highs():
-    """从缓存 *_ohlc.csv 读真实 low/high，对齐 CURRENT_UNI 公共交易日。
-    返回 (close_df, open_df, high_df, low_df)。数据文件已缓存，免网络。"""
-    ccols, ocols, hcols, lcols = {}, {}, {}, {}
-    for code in CURRENT_UNI:
-        cf = os.path.join(CACHE, f"etf_{code}_ohlc.csv")
-        if not os.path.exists(cf):
-            print(f"[warn] 缺 {cf}，跳过；该标的不参与熔断模拟")
-            continue
-        df = pd.read_csv(cf, dtype={"date": str})
-        df["date"] = pd.to_datetime(df["date"])
-        idx = pd.to_datetime(df["date"])
-        ccols[code] = pd.Series(pd.to_numeric(df["close"], errors="coerce").values, index=idx)
-        ocols[code] = pd.Series(pd.to_numeric(df["open"], errors="coerce").values, index=idx)
-        hcols[code] = pd.Series(pd.to_numeric(df["high"], errors="coerce").values, index=idx)
-        lcols[code] = pd.Series(pd.to_numeric(df["low"], errors="coerce").values, index=idx)
-    close = pd.DataFrame(ccols).dropna()
-    open_ = pd.DataFrame(ocols).reindex(close.index)
-    high = pd.DataFrame(hcols).reindex(close.index)
-    low = pd.DataFrame(lcols).reindex(close.index)
-    def _srt(x):
-        x = x.sort_index()
-        x.index = pd.DatetimeIndex(x.index)
-        return x
-    return _srt(close), _srt(open_), _srt(high), _srt(low)
+    """统一复权口径加载（复用 bue.load_ohlc 单源，历史除权已前复权）。
+    返回 (close_df, open_df, high_df, low_df)。"""
+    return bue.load_ohlc(CURRENT_UNI)
 
 
 def run(name, halt_pct):

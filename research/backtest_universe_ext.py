@@ -77,16 +77,6 @@ def fetch_sina(code, symbol):
     return df.set_index("date")["close"]
 
 
-def load_prices():
-    """全部 11 只真实 ETF 收盘价（同一数据口径）。"""
-    cols = {}
-    for code, sym in ALL_CODES.items():
-        cols[code] = fetch_sina(code, sym)
-    price = pd.DataFrame(cols).dropna()
-    price.index = pd.to_datetime(price.index)
-    return price.sort_index()
-
-
 def fetch_open(code, symbol):
     """新浪真实 ETF 全历史开盘价（缓存到 etf_<code>_open.csv）。返回 Series。
     与 fetch_sina 同一数据源、同日期口径，供「次日开盘价成交」回测使用。"""
@@ -108,23 +98,93 @@ def fetch_open(code, symbol):
     return df.set_index("date")["open"]
 
 
-def load_prices_open(codes=None):
-    """加载真实 ETF 收盘价 + 开盘价（对齐同一公共交易日）。
-    返回 (close_df, open_df)。codes=None 用全部 ALL_CODES。"""
+# ====================== 除权前复权统一修正（统一数据口径） ======================
+# 背景：新浪真实 ETF 日线在份额拆分/分红（除权）日价格会跳空，若不修正，
+#   除权年会产生"伪收益"（实测 510500 2015-04-15 除权日 +248%、513100 2022-01-14 -80.5%、
+#   513500 2022-03-30 -49.2%）。除权日总市值不变、仅单位净值跳变，收益率应连续。
+#   strategy_rotator 用 close 做动量打分、回测用 open/close 成交 —— 若不前复权，
+#   除权日收益失真会污染动量/止损/成交价，导致回测伪收益（2015 年荒谬 +378%）。
+# 修正做法（与 backtest_halt_threshold 一致）：检测单日 |收益|>35% 的除权跳空，
+#   因子 = 除权日开盘 / 除权前最后收盘（open 相对前收的跳变，隔离"除权缺口"与当日真实波动），
+#   把该日【之前】所有 open/high/low/close ×factor，使除权日收益连续（前复权）。
+#   除权日顶点(mask 不含 dt)：mask = 索引 < dt，即修正 dt 之前的价，dt 当日价不动 ↓ 方向正确。
+_DISTORT_THRESH = 0.35   # 单日|收益|>35% 视为除权跳空（真实 ETF 除权外极少触发）
+
+
+def deadjust_ohlc(code, ohlc_df):
+    """对单只 ETF 的 OHLC DataFrame（索引=日期, 列=open/high/low/close）做前复权修正，原地改并返回。
+    修正【除权日之前】的价格 ×因子，因为是前复权（把历史价对齐到最新单位净值口径）。"""
+    close_s = ohlc_df["close"].astype(float)
+    jump = (close_s / close_s.shift(1) - 1.0).fillna(0.0)
+    dirty = jump[jump.abs() > _DISTORT_THRESH]
+    for dt in dirty.index:
+        prev_close = float(close_s.shift(1).loc[dt])
+        if not (prev_close > 0):
+            continue
+        factor = float(ohlc_df.loc[dt, "open"] / prev_close)
+        if abs(factor - 1.0) < 0.05:      # 打开后仍连续 = 非除权，跳过
+            continue
+        mask = ohlc_df.index < dt
+        for col in ["open", "high", "low", "close"]:
+            ohlc_df.loc[mask, col] = ohlc_df.loc[mask, col] * factor
+    return ohlc_df
+
+
+def load_ohlc(codes=None):
+    """统一加载真实 ETF 完整 OHLC（etf_<code>_ohlc.csv），已做前复权修正。
+    返回 (close_df, open_df, high_df, low_df)，公共交易日对齐。codes=None 用 ALL_CODES。
+    缓存存在即复用（不联网）。与 fetch_sina/fetch_open 单一数据源：这里用 *_ohlc.csv，
+    fetch_sina 用 *_ohlc.csv 的 close、fetch_open 用 *_ohlc.csv 的 open，保证全链路一致。"""
     if codes is None:
         codes = list(ALL_CODES)
-    ccols, ocols = {}, {}
+    ccols, ocols, hcols, lcols = {}, {}, {}, {}
     for code in codes:
-        sym = ALL_CODES[code]
-        ccols[code] = fetch_sina(code, sym)
-        ocols[code] = fetch_open(code, sym)
+        cf = os.path.join(CACHE, f"etf_{code}_ohlc.csv")
+        if not os.path.exists(cf):
+            # 无 OHLC 缓存：退到 close 缓存（单列），复权修正退化为 close-jump 因子（无 open 精确隔离）
+            mapping = {code: fetch_sina(code, ALL_CODES[code])}
+            ccols[code] = mapping[code]
+            continue
+        df = pd.read_csv(cf, dtype={"date": str})
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").drop_duplicates("date").set_index("date")
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = deadjust_ohlc(code, df)
+        ccols[code] = df["close"]
+        ocols[code] = df["open"]
+        hcols[code] = df["high"]
+        lcols[code] = df["low"]
     close = pd.DataFrame(ccols).dropna()
-    open_ = pd.DataFrame(ocols)
-    common = close.index.intersection(open_.index)
-    close = close.reindex(common).sort_index()
-    open_ = open_.reindex(common).sort_index()
     close.index = pd.to_datetime(close.index)
-    open_.index = pd.to_datetime(open_.index)
+    if ocols:
+        open_ = pd.DataFrame(ocols).reindex(close.index)
+        open_.index = pd.to_datetime(open_.index)
+        high = pd.DataFrame(hcols).reindex(close.index)
+        high.index = pd.to_datetime(high.index)
+        low = pd.DataFrame(lcols).reindex(close.index)
+        low.index = pd.to_datetime(low.index)
+    else:
+        open_ = high = low = None
+    def _srt(x):
+        if x is None:
+            return x
+        x = x.sort_index()
+        x.index = pd.DatetimeIndex(x.index)
+        return x
+    return _srt(close), _srt(open_), _srt(high), _srt(low)
+
+
+def load_prices():
+    """全部 11 只真实 ETF 收盘价（统一前复权口径；等价于 close=load_ohlc() 的 close）。"""
+    close, _, _, _ = load_ohlc()
+    return close.sort_index()
+
+
+def load_prices_open(codes=None):
+    """加载真实 ETF 收盘价 + 开盘价（统一前复权口径，对齐同一公共交易日）。
+    返回 (close_df, open_df)。codes=None 用全部 ALL_CODES。"""
+    close, open_, _, _ = load_ohlc(codes)
     return close.astype(float), open_.astype(float)
 
 
